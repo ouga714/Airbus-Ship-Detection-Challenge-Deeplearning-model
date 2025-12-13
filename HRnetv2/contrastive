@@ -1,0 +1,1529 @@
+#!/usr/bin/env python3
+#ファイル名：ship_hrnetv2_seg_cl_ablation.py
+
+
+"""
+Airbus Ship Detection (Kaggle):
+  - HRNetV2 (timm hrnet_w32 / hrnet_w18 etc) as features_only backbone
+  - Multi-scale feature fusion + segmentation head (1 class: ship vs background)
+  - + Pixel-wise contrastive learning (two-view, supervised NT-Xent style)
+  - Curriculum hard: warmup(seg only) -> seg + lambda*CL (boundary emphasis)
+  - Ablations:
+      1) baseline (seg only)
+      2) baseline + CL(change pixels only = ship only)
+      3) baseline + CL(non-change pixels only = background only)
+      4) baseline + CL(both)
+  - Local evaluation: instance-level mean F2 over IoU thresholds + pixel metrics
+  - Kaggle official test inference -> submission CSV (RLE, multiple rows per image)
+  - Logging, checkpoints, best saving, resume
+
+Notes:
+  - "change" corresponds to ship=1 pixels, "non-change" corresponds to background=0 pixels.
+  - For CL, two views share the same spatial transform so pixel correspondence is preserved.
+"""
+
+import os
+import sys
+import json
+import time
+import glob
+import argparse
+import logging
+import datetime
+import random
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+try:
+    import timm
+except ImportError:
+    print("[ERROR] timm が見つかりません。`pip install timm` を実行してください。", file=sys.stderr)
+    raise
+
+# AMP: torch.amp が推奨。古いtorchでも動くようにフォールバック。
+try:
+    from torch.amp import autocast as amp_autocast
+    from torch.amp import GradScaler as AmpGradScaler
+    AMP_NEW = True
+except Exception:
+    from torch.cuda.amp import autocast as amp_autocast
+    from torch.cuda.amp import GradScaler as AmpGradScaler
+    AMP_NEW = False
+
+
+# ---------------------------
+# Utils
+# ---------------------------
+
+def now_str():
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def set_seed(seed: int, deterministic: bool = False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
+def setup_logger(log_path: str) -> logging.Logger:
+    logger = logging.getLogger("ship_hrnetv2_cl")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    ensure_dir(os.path.dirname(log_path))
+    fh = logging.FileHandler(log_path)
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    return logger
+
+def save_json(path: str, obj: dict):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def list_images(folder: str, exts=(".jpg", ".jpeg", ".png", ".tif", ".tiff")) -> List[str]:
+    files = []
+    for e in exts:
+        files.extend(glob.glob(os.path.join(folder, f"*{e}")))
+    files = sorted(files)
+    return files
+
+def clamp01(x: np.ndarray) -> np.ndarray:
+    return np.clip(x, 0.0, 1.0)
+
+
+# ---------------------------
+# RLE (Kaggle format)
+# ---------------------------
+
+def rle_encode(mask: np.ndarray) -> str:
+    """
+    mask: (H,W) {0,1} uint8
+    returns: RLE string
+    """
+    if mask.ndim != 2:
+        raise ValueError("mask must be 2D")
+
+    pixels = mask.T.flatten()  # Fortran-like
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] = runs[1::2] - runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+def rle_decode(rle: str, shape: Tuple[int, int]) -> np.ndarray:
+    """
+    rle: "start length start length ..."
+    shape: (H,W)
+    returns: (H,W) {0,1} uint8
+    """
+    h, w = shape
+    mask = np.zeros(h * w, dtype=np.uint8)
+    if rle is None or rle == "" or (isinstance(rle, float) and np.isnan(rle)):
+        return mask.reshape((w, h)).T
+
+    s = list(map(int, rle.split()))
+    starts = s[0::2]
+    lengths = s[1::2]
+    for st, le in zip(starts, lengths):
+        st -= 1
+        mask[st:st + le] = 1
+    return mask.reshape((w, h)).T
+
+
+# ---------------------------
+# Connected Components (instances)
+# ---------------------------
+
+def _label_connected_components(binary_mask: np.ndarray) -> Tuple[np.ndarray, int]:
+    """
+    Returns labeled mask (H,W) with labels 0..N, and N (#components).
+    Try OpenCV first, else skimage.
+    """
+    if binary_mask.dtype != np.uint8:
+        binary_mask = binary_mask.astype(np.uint8)
+
+    try:
+        import cv2
+        num_labels, labels = cv2.connectedComponents(binary_mask, connectivity=8)
+        return labels.astype(np.int32), (num_labels - 1)
+    except Exception:
+        pass
+
+    try:
+        from skimage.measure import label as sk_label
+        labels = sk_label(binary_mask, connectivity=2)
+        n = int(labels.max())
+        return labels.astype(np.int32), n
+    except Exception as e:
+        raise RuntimeError(
+            "connected components に cv2 / skimage が必要です。"
+            "無い場合は `pip install opencv-python scikit-image`"
+        ) from e
+
+def mask_to_instances(binary_mask: np.ndarray, min_area: int = 0) -> List[np.ndarray]:
+    labels, n = _label_connected_components(binary_mask.astype(np.uint8))
+    insts = []
+    for k in range(1, n + 1):
+        m = (labels == k).astype(np.uint8)
+        if min_area > 0 and m.sum() < min_area:
+            continue
+        insts.append(m)
+    return insts
+
+def iou(a: np.ndarray, b: np.ndarray) -> float:
+    inter = float(np.logical_and(a, b).sum())
+    union = float(np.logical_or(a, b).sum())
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+def iou_matrix(gt_insts: List[np.ndarray], pr_insts: List[np.ndarray]) -> np.ndarray:
+    if len(gt_insts) == 0 or len(pr_insts) == 0:
+        return np.zeros((len(gt_insts), len(pr_insts)), dtype=np.float32)
+    mat = np.zeros((len(gt_insts), len(pr_insts)), dtype=np.float32)
+    for i in range(len(gt_insts)):
+        for j in range(len(pr_insts)):
+            mat[i, j] = iou(gt_insts[i], pr_insts[j])
+    return mat
+
+def match_tp_fp_fn(iou_mat: np.ndarray, thr: float) -> Tuple[int, int, int]:
+    G, P = iou_mat.shape
+    if G == 0 and P == 0:
+        return 0, 0, 0
+    if G == 0:
+        return 0, P, 0
+    if P == 0:
+        return 0, 0, G
+
+    pairs = []
+    for i in range(G):
+        for j in range(P):
+            if iou_mat[i, j] >= thr:
+                pairs.append((iou_mat[i, j], i, j))
+    pairs.sort(reverse=True, key=lambda x: x[0])
+
+    matched_g = set()
+    matched_p = set()
+    tp = 0
+    for _, i, j in pairs:
+        if i in matched_g or j in matched_p:
+            continue
+        matched_g.add(i)
+        matched_p.add(j)
+        tp += 1
+
+    fp = P - tp
+    fn = G - tp
+    return tp, fp, fn
+
+def fbeta(precision: float, recall: float, beta: float = 2.0) -> float:
+    b2 = beta * beta
+    denom = (b2 * precision + recall)
+    if denom <= 0:
+        return 0.0
+    return (1 + b2) * precision * recall / denom
+
+def kaggle_mean_f2_for_image(gt_mask_bin: np.ndarray,
+                             pr_mask_bin: np.ndarray,
+                             iou_thrs: List[float],
+                             min_area: int = 0) -> float:
+    gt_insts = mask_to_instances(gt_mask_bin, min_area=0)
+    pr_insts = mask_to_instances(pr_mask_bin, min_area=min_area)
+
+    mat = iou_matrix(gt_insts, pr_insts)
+    scores = []
+    for t in iou_thrs:
+        tp, fp, fn = match_tp_fp_fn(mat, t)
+        prec = tp / (tp + fp + 1e-9)
+        rec  = tp / (tp + fn + 1e-9)
+        scores.append(fbeta(prec, rec, beta=2.0))
+    return float(np.mean(scores)) if len(scores) else 0.0
+
+def pixel_confusion(gt: np.ndarray, pr: np.ndarray) -> Tuple[int, int, int, int]:
+    gt = gt.astype(np.uint8)
+    pr = pr.astype(np.uint8)
+    tp = int(np.logical_and(gt == 1, pr == 1).sum())
+    fp = int(np.logical_and(gt == 0, pr == 1).sum())
+    fn = int(np.logical_and(gt == 1, pr == 0).sum())
+    tn = int(np.logical_and(gt == 0, pr == 0).sum())
+    return tp, fp, fn, tn
+
+def pixel_metrics_from_conf(tp: int, fp: int, fn: int, tn: int) -> Dict[str, float]:
+    precision = tp / (tp + fp + 1e-9)
+    recall    = tp / (tp + fn + 1e-9)
+    iou_      = tp / (tp + fp + fn + 1e-9)
+    f2_       = fbeta(precision, recall, beta=2.0)
+
+    total = tp + fp + fn + tn
+    if total <= 0:
+        kappa = 0.0
+    else:
+        po = (tp + tn) / total
+        pe = (((tp + fp) / total) * ((tp + fn) / total) +
+              ((fn + tn) / total) * ((fp + tn) / total))
+        denom = (1 - pe)
+        kappa = (np.float64(po) - np.float64(pe)) / np.float64(denom) if denom != 0 else 0.0
+
+    return {
+        "F2": float(f2_),
+        "IoU": float(iou_),
+        "precision": float(precision),
+        "recall": float(recall),
+        "kappa": float(kappa),
+    }
+
+
+# ---------------------------
+# Dataset
+# ---------------------------
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+def _img_to_float01_rgb(img: Image.Image) -> np.ndarray:
+    arr = np.asarray(img.convert("RGB")).astype(np.float32) / 255.0
+    return arr
+
+def _apply_photometric_augment(arr01: np.ndarray,
+                              brightness: float,
+                              contrast: float,
+                              gamma: float,
+                              noise_std: float) -> np.ndarray:
+    x = arr01.copy()
+
+    # brightness: x + b
+    if brightness > 0:
+        b = np.random.uniform(-brightness, brightness)
+        x = x + b
+
+    # contrast: (x - mean)*c + mean
+    if contrast > 0:
+        c = np.random.uniform(1.0 - contrast, 1.0 + contrast)
+        mean = x.mean(axis=(0, 1), keepdims=True)
+        x = (x - mean) * c + mean
+
+    # gamma: x^(1/g)
+    if gamma > 0:
+        g = np.random.uniform(1.0 - gamma, 1.0 + gamma)
+        g = max(g, 1e-3)
+        x = np.power(clamp01(x), 1.0 / g)
+
+    # gaussian noise
+    if noise_std > 0:
+        ns = np.random.uniform(0.0, noise_std)
+        x = x + np.random.normal(0.0, ns, size=x.shape).astype(np.float32)
+
+    return clamp01(x)
+
+def _normalize_imagenet(arr01: np.ndarray) -> np.ndarray:
+    mean = np.array(IMAGENET_MEAN, dtype=np.float32).reshape(1, 1, 3)
+    std  = np.array(IMAGENET_STD,  dtype=np.float32).reshape(1, 1, 3)
+    x = (arr01 - mean) / std
+    return x
+
+def _hwc_to_chw(arr: np.ndarray) -> np.ndarray:
+    return np.transpose(arr, (2, 0, 1))
+
+class ShipSegDataset(Dataset):
+    """
+    If two_views=True:
+      - apply the same spatial transform (flip) to image+mask
+      - then create two photometric variants (view1, view2) so pixel alignment holds.
+    """
+    def __init__(self,
+                 images_dir: str,
+                 masks_dir: Optional[str],
+                 resize: Optional[int] = None,
+                 augment: bool = False,
+                 two_views: bool = False,
+                 photometric_brightness: float = 0.15,
+                 photometric_contrast: float = 0.20,
+                 photometric_gamma: float = 0.15,
+                 photometric_noise_std: float = 0.03):
+        self.images_dir = images_dir
+        self.masks_dir = masks_dir
+        self.resize = resize
+        self.augment = augment
+        self.two_views = two_views
+
+        self.photometric_brightness = photometric_brightness
+        self.photometric_contrast = photometric_contrast
+        self.photometric_gamma = photometric_gamma
+        self.photometric_noise_std = photometric_noise_std
+
+        self.image_paths = list_images(images_dir, exts=(".jpg", ".jpeg", ".png"))
+        if len(self.image_paths) == 0:
+            raise RuntimeError(f"No images found in {images_dir}")
+
+        self.has_masks = masks_dir is not None and os.path.isdir(masks_dir)
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def _read_image(self, path: str) -> Image.Image:
+        return Image.open(path).convert("RGB")
+
+    def _read_mask(self, img_path: str) -> Image.Image:
+        if not self.has_masks:
+            raise RuntimeError("Masks not available")
+        base = os.path.basename(img_path)
+        stem, _ = os.path.splitext(base)
+        mask_path = os.path.join(self.masks_dir, stem + ".png")
+        if not os.path.exists(mask_path):
+            alt = os.path.join(self.masks_dir, stem + ".jpg")
+            if os.path.exists(alt):
+                mask_path = alt
+            else:
+                raise FileNotFoundError(f"Mask not found: {mask_path}")
+        return Image.open(mask_path).convert("L")
+
+    def _mask_to_tensor(self, mask: Image.Image) -> torch.Tensor:
+        arr = (np.asarray(mask) > 127).astype(np.float32)
+        return torch.from_numpy(arr).unsqueeze(0)
+
+    def __getitem__(self, idx: int):
+        img_path = self.image_paths[idx]
+        img = self._read_image(img_path)
+        orig_w, orig_h = img.size
+
+        mask = None
+        if self.has_masks:
+            mask = self._read_mask(img_path)
+
+        # resize (keep alignment)
+        if self.resize is not None:
+            img = img.resize((self.resize, self.resize), resample=Image.BILINEAR)
+            if mask is not None:
+                mask = mask.resize((self.resize, self.resize), resample=Image.NEAREST)
+
+        # spatial augment (same for view1/view2)
+        if self.augment:
+            # horizontal flip
+            if random.random() < 0.5:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                if mask is not None:
+                    mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+            # vertical flip
+            if random.random() < 0.5:
+                img = img.transpose(Image.FLIP_TOP_BOTTOM)
+                if mask is not None:
+                    mask = mask.transpose(Image.FLIP_TOP_BOTTOM)
+
+        # convert to float array
+        arr01 = _img_to_float01_rgb(img)
+
+        if self.two_views:
+            v1 = _apply_photometric_augment(
+                arr01,
+                brightness=self.photometric_brightness,
+                contrast=self.photometric_contrast,
+                gamma=self.photometric_gamma,
+                noise_std=self.photometric_noise_std
+            )
+            v2 = _apply_photometric_augment(
+                arr01,
+                brightness=self.photometric_brightness,
+                contrast=self.photometric_contrast,
+                gamma=self.photometric_gamma,
+                noise_std=self.photometric_noise_std
+            )
+            v1 = _normalize_imagenet(v1)
+            v2 = _normalize_imagenet(v2)
+            x1 = torch.from_numpy(_hwc_to_chw(v1)).float()
+            x2 = torch.from_numpy(_hwc_to_chw(v2)).float()
+        else:
+            v = _normalize_imagenet(arr01)
+            x1 = torch.from_numpy(_hwc_to_chw(v)).float()
+            x2 = None
+
+        if mask is not None:
+            y = self._mask_to_tensor(mask)
+        else:
+            # dummy (for official test)
+            y = torch.zeros((1, x1.shape[1], x1.shape[2]), dtype=torch.float32)
+
+        image_id = os.path.basename(img_path)
+        out = {
+            "image": x1,
+            "mask": y,
+            "image_id": image_id,
+            "orig_size": (orig_h, orig_w),
+        }
+        if self.two_views:
+            out["image2"] = x2
+        return out
+
+
+# ---------------------------
+# Model: HRNet backbone (features_only) + multi-scale fusion + seg head + proj head
+# ---------------------------
+
+class HRNetSegCL(nn.Module):
+    def __init__(self,
+                 backbone_name: str = "hrnet_w32.ms_in1k",
+                 pretrained: bool = True,
+                 fuse_ch: int = 64,
+                 embed_dim: int = 64,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(0, 1, 2, 3),
+        )
+
+        feat_info = self.backbone.feature_info
+        try:
+            chs = feat_info.channels()
+        except Exception:
+            chs = [f["num_chs"] for f in feat_info]
+
+        # project each scale to fuse_ch
+        self.proj = nn.ModuleList([nn.Conv2d(c, fuse_ch, kernel_size=1) for c in chs])
+
+        # fuse block (LazyConv to adapt to variable number of scales)
+        self.fuse_block = nn.Sequential(
+            nn.LazyConv2d(fuse_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(fuse_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=dropout),
+        )
+        # segmentation head
+        self.seg_head = nn.Conv2d(fuse_ch, 1, kernel_size=1)
+
+        # projection head for CL
+        self.proj_head = nn.Sequential(
+            nn.Conv2d(fuse_ch, embed_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor, return_embed: bool = False):
+        feats = self.backbone(x)  # list of tensors
+        if len(feats) == 0:
+            raise RuntimeError("Backbone returned empty features")
+
+        target_h, target_w = feats[0].shape[-2], feats[0].shape[-1]
+        ups = []
+        for i, f in enumerate(feats):
+            if i >= len(self.proj):
+                raise RuntimeError(f"proj length ({len(self.proj)}) < feats length ({len(feats)})")
+            p = self.proj[i](f)
+            if p.shape[-2:] != (target_h, target_w):
+                p = F.interpolate(p, size=(target_h, target_w), mode="bilinear", align_corners=False)
+            ups.append(p)
+
+        fused = torch.cat(ups, dim=1)
+        fuse_feat = self.fuse_block(fused)
+        logit = self.seg_head(fuse_feat)
+        if logit.shape[-2:] != x.shape[-2:]:
+            logit = F.interpolate(logit, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+        if not return_embed:
+            return logit
+
+        emb = self.proj_head(fuse_feat)
+        if emb.shape[-2:] != x.shape[-2:]:
+            emb = F.interpolate(emb, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        # L2 normalize per pixel
+        emb = F.normalize(emb, p=2, dim=1)
+        return logit, emb
+
+
+# ---------------------------
+# Losses
+# ---------------------------
+
+class DiceLoss(nn.Module):
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits)
+        num = 2 * (probs * targets).sum(dim=(2, 3))
+        den = (probs + targets).sum(dim=(2, 3)) + self.eps
+        dice = 1 - (num + self.eps) / den
+        return dice.mean()
+
+def compute_boundary_band(mask01: torch.Tensor, width: int = 2) -> torch.Tensor:
+    """
+    mask01: (B,1,H,W) float in {0,1}
+    boundary band computed by morphological gradient:
+      boundary = dilate(mask) != erode(mask)
+    """
+    if width <= 0:
+        return torch.zeros_like(mask01, dtype=torch.bool)
+
+    k = 2 * width + 1
+    # dilation
+    dil = F.max_pool2d(mask01, kernel_size=k, stride=1, padding=width)
+    # erosion: 1 - dilation(1-mask)
+    ero = 1.0 - F.max_pool2d(1.0 - mask01, kernel_size=k, stride=1, padding=width)
+    boundary = (dil - ero).abs() > 0.5
+    return boundary
+
+def sample_pixels_for_cl(emb1: torch.Tensor,
+                         emb2: torch.Tensor,
+                         mask01: torch.Tensor,
+                         samples_per_img: int,
+                         boundary: Optional[torch.Tensor] = None,
+                         boundary_ratio: float = 0.7) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    emb1, emb2: (B,D,H,W), L2 normalized
+    mask01: (B,1,H,W) float {0,1}
+    boundary: (B,1,H,W) bool or None
+    returns:
+      z1: (N,D)
+      z2: (N,D)
+      y : (N,) long in {0,1}
+    Strategy:
+      - Try to sample half from pos, half from neg per image (fallback if insufficient)
+      - Optionally oversample boundary pixels
+    """
+    B, D, H, W = emb1.shape
+    device = emb1.device
+
+    z1_list = []
+    z2_list = []
+    y_list = []
+
+    k_each = max(samples_per_img // 2, 1)
+
+    for b in range(B):
+        m = mask01[b, 0]  # (H,W)
+        pos_idx = torch.nonzero(m > 0.5, as_tuple=False).view(-1)
+        neg_idx = torch.nonzero(m <= 0.5, as_tuple=False).view(-1)
+
+        if boundary is not None:
+            bd = boundary[b, 0].view(-1)
+            pos_bd = pos_idx[bd[pos_idx]] if pos_idx.numel() > 0 else pos_idx
+            neg_bd = neg_idx[bd[neg_idx]] if neg_idx.numel() > 0 else neg_idx
+        else:
+            pos_bd = pos_idx
+            neg_bd = neg_idx
+
+        def _sample_from(idx_all: torch.Tensor, idx_bd: torch.Tensor, k: int) -> torch.Tensor:
+            if idx_all.numel() == 0:
+                return idx_all
+            if idx_bd is None or idx_bd.numel() == 0 or boundary is None:
+                # pure random
+                perm = torch.randperm(idx_all.numel(), device=device)
+                return idx_all[perm[:min(k, idx_all.numel())]]
+            # boundary prioritized
+            k_bd = int(round(k * boundary_ratio))
+            k_bd = max(min(k_bd, k), 0)
+            k_rd = k - k_bd
+            sel = []
+            if idx_bd.numel() > 0 and k_bd > 0:
+                perm_bd = torch.randperm(idx_bd.numel(), device=device)
+                sel.append(idx_bd[perm_bd[:min(k_bd, idx_bd.numel())]])
+            if k_rd > 0:
+                perm_all = torch.randperm(idx_all.numel(), device=device)
+                sel.append(idx_all[perm_all[:min(k_rd, idx_all.numel())]])
+            if len(sel) == 0:
+                return idx_all[:0]
+            return torch.cat(sel, dim=0)
+
+        pos_s = _sample_from(pos_idx, pos_bd, k_each)
+        neg_s = _sample_from(neg_idx, neg_bd, k_each)
+
+        # if one class is missing, fill from the other
+        if pos_s.numel() == 0 and neg_s.numel() == 0:
+            continue
+        if pos_s.numel() == 0 and neg_idx.numel() > 0:
+            pos_s = _sample_from(neg_idx, neg_bd, k_each)  # fallback
+        if neg_s.numel() == 0 and pos_idx.numel() > 0:
+            neg_s = _sample_from(pos_idx, pos_bd, k_each)  # fallback
+
+        flat_emb1 = emb1[b].view(D, -1).transpose(0, 1)  # (HW, D)
+        flat_emb2 = emb2[b].view(D, -1).transpose(0, 1)  # (HW, D)
+
+        # build samples
+        s_idx = torch.cat([pos_s, neg_s], dim=0)
+        # labels
+        y = torch.cat([
+            torch.ones(pos_s.numel(), device=device, dtype=torch.long),
+            torch.zeros(neg_s.numel(), device=device, dtype=torch.long)
+        ], dim=0)
+
+        z1_list.append(flat_emb1[s_idx])
+        z2_list.append(flat_emb2[s_idx])
+        y_list.append(y)
+
+    if len(z1_list) == 0:
+        return (
+            torch.zeros((0, D), device=device),
+            torch.zeros((0, D), device=device),
+            torch.zeros((0,), device=device, dtype=torch.long),
+        )
+
+    z1 = torch.cat(z1_list, dim=0)
+    z2 = torch.cat(z2_list, dim=0)
+    y  = torch.cat(y_list, dim=0)
+    return z1, z2, y
+
+def masked_supervised_ntxent(z1: torch.Tensor,
+                             z2: torch.Tensor,
+                             y: torch.Tensor,
+                             mode: str,
+                             tau: float = 0.2) -> torch.Tensor:
+    """
+    z1, z2: (N,D) L2 normalized
+    y: (N,) labels in {0,1}
+    mode:
+      - "cl_pos": only anchors with y=1
+      - "cl_neg": only anchors with y=0
+      - "cl_both": anchors with y in {0,1}
+    Loss:
+      For anchor i, positive is paired j=i in z2.
+      Denominator contains: {j=i} union {j where y[j] != y[i]}
+      i.e. push only against opposite class (boundary separation emphasis).
+    """
+    if z1.numel() == 0:
+        return torch.zeros((), device=z1.device)
+
+    N = z1.shape[0]
+    if N <= 1:
+        return torch.zeros((), device=z1.device)
+
+    if mode == "cl_pos":
+        anchor_mask = (y == 1)
+    elif mode == "cl_neg":
+        anchor_mask = (y == 0)
+    elif mode == "cl_both":
+        anchor_mask = torch.ones_like(y, dtype=torch.bool)
+    else:
+        raise ValueError(f"Unknown CL mode: {mode}")
+
+    if anchor_mask.sum().item() == 0:
+        return torch.zeros((), device=z1.device)
+
+    # similarity (N,N)
+    sim = (z1 @ z2.t()) / max(tau, 1e-6)  # cosine since normalized
+    # for numerical stability
+    sim = sim - sim.max(dim=1, keepdim=True).values
+
+    exp_sim = torch.exp(sim)  # (N,N)
+
+    # build loss over anchors
+    idx = torch.arange(N, device=z1.device)
+
+    losses = []
+    anchor_indices = idx[anchor_mask]
+    for i in anchor_indices.tolist():
+        yi = int(y[i].item())
+        # allowed negatives: opposite class; always include positive j=i
+        allowed = (y != yi)
+        allowed[i] = True  # include its positive
+        denom = exp_sim[i, allowed].sum() + 1e-12
+        num = exp_sim[i, i] + 1e-12
+        losses.append(-torch.log(num / denom))
+
+    return torch.stack(losses, dim=0).mean()
+
+
+# ---------------------------
+# Train / Eval
+# ---------------------------
+
+@dataclass
+class EpochResult:
+    train_loss: float
+    val_loss: float
+    best_prob_thr: float
+    val_kaggle_mean_f2: float
+    val_pixel: Dict[str, float]
+    lam_eff: float
+    cl_loss: float
+
+def curriculum_hard_lambda(epoch: int, warmup_epochs: int, lam: float) -> float:
+    return 0.0 if epoch <= warmup_epochs else lam
+
+def train_one_epoch(model,
+                    loader,
+                    optimizer,
+                    scaler,
+                    device,
+                    use_amp: bool,
+                    bce_loss: nn.Module,
+                    dice_loss: nn.Module,
+                    cl_mode: str,
+                    lam_eff: float,
+                    tau: float,
+                    cl_samples_per_img: int,
+                    cl_use_boundary: bool,
+                    cl_boundary_width: int,
+                    cl_boundary_ratio: float,
+                    logger: logging.Logger,
+                    epoch: int,
+                    epochs: int,
+                    log_interval: int = 200) -> Tuple[float, float]:
+    """
+    Returns:
+      avg_total_loss, avg_cl_loss
+    """
+    model.train()
+    total_loss = 0.0
+    total_cl = 0.0
+    n = 0
+
+    for it, batch in enumerate(loader, start=1):
+        optimizer.zero_grad(set_to_none=True)
+
+        if lam_eff > 0.0 and "image2" in batch:
+            x1 = batch["image"].to(device, non_blocking=True)
+            x2 = batch["image2"].to(device, non_blocking=True)
+            y1 = batch["mask"].to(device, non_blocking=True)
+            y2 = y1  # same spatial transform, same mask
+
+            x = torch.cat([x1, x2], dim=0)  # (2B,3,H,W)
+            y = torch.cat([y1, y2], dim=0)  # (2B,1,H,W)
+
+            if use_amp:
+                if AMP_NEW:
+                    with amp_autocast(device_type="cuda"):
+                        logits, emb = model(x, return_embed=True)
+                        # seg on both views
+                        seg = bce_loss(logits, y) + dice_loss(logits, y)
+                else:
+                    with amp_autocast():
+                        logits, emb = model(x, return_embed=True)
+                        seg = bce_loss(logits, y) + dice_loss(logits, y)
+            else:
+                logits, emb = model(x, return_embed=True)
+                seg = bce_loss(logits, y) + dice_loss(logits, y)
+
+            B2 = x.shape[0] // 2
+            emb1 = emb[:B2]
+            emb2 = emb[B2:]
+            m1 = y1.detach()
+
+            boundary = None
+            if cl_use_boundary:
+                boundary = compute_boundary_band(m1, width=cl_boundary_width)
+
+            z1, z2, yy = sample_pixels_for_cl(
+                emb1=emb1, emb2=emb2,
+                mask01=m1,
+                samples_per_img=cl_samples_per_img,
+                boundary=boundary,
+                boundary_ratio=cl_boundary_ratio
+            )
+            cl = masked_supervised_ntxent(z1, z2, yy, mode=cl_mode, tau=tau)
+
+            loss = seg + lam_eff * cl
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            total_loss += float(loss.item()) * x1.size(0)
+            total_cl += float(cl.item()) * x1.size(0)
+            n += x1.size(0)
+
+        else:
+            x = batch["image"].to(device, non_blocking=True)
+            y = batch["mask"].to(device, non_blocking=True)
+
+            if use_amp:
+                if AMP_NEW:
+                    with amp_autocast(device_type="cuda"):
+                        logits = model(x, return_embed=False)
+                        loss = bce_loss(logits, y) + dice_loss(logits, y)
+                else:
+                    with amp_autocast():
+                        logits = model(x, return_embed=False)
+                        loss = bce_loss(logits, y) + dice_loss(logits, y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits = model(x, return_embed=False)
+                loss = bce_loss(logits, y) + dice_loss(logits, y)
+                loss.backward()
+                optimizer.step()
+
+            total_loss += float(loss.item()) * x.size(0)
+            n += x.size(0)
+
+        if it == 1 or it % log_interval == 0 or it == len(loader):
+            if lam_eff > 0.0 and "image2" in batch:
+                logger.info(
+                    f"[Train] Ep{epoch:03d}/{epochs:03d} Iter {it:05d}/{len(loader):05d} "
+                    f"loss={loss.item():.4f} (seg={seg.item():.4f}, cl={cl.item():.4f}, lam={lam_eff:.3f})"
+                )
+            else:
+                logger.info(
+                    f"[Train] Ep{epoch:03d}/{epochs:03d} Iter {it:05d}/{len(loader):05d} "
+                    f"loss={loss.item():.4f} (seg_only)"
+                )
+
+    avg_loss = total_loss / max(n, 1)
+    avg_cl = total_cl / max(n, 1)
+    return avg_loss, avg_cl
+
+@torch.no_grad()
+def eval_and_tune_threshold(model, loader, device, use_amp: bool,
+                            bce_loss: nn.Module, dice_loss: nn.Module,
+                            prob_thrs: List[float], iou_thrs: List[float],
+                            tune_max_images: int, min_area: int,
+                            logger: logging.Logger) -> Tuple[float, float, float, Dict[str, float]]:
+    model.eval()
+
+    thr_sum_f2 = {t: 0.0 for t in prob_thrs}
+    thr_conf = {t: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for t in prob_thrs}
+
+    total_loss = 0.0
+    n = 0
+    seen = 0
+
+    for batch in loader:
+        x = batch["image"].to(device, non_blocking=True)
+        y = batch["mask"].to(device, non_blocking=True)
+
+        if use_amp:
+            if AMP_NEW:
+                with amp_autocast(device_type="cuda"):
+                    logits = model(x, return_embed=False)
+                    loss = bce_loss(logits, y) + dice_loss(logits, y)
+            else:
+                with amp_autocast():
+                    logits = model(x, return_embed=False)
+                    loss = bce_loss(logits, y) + dice_loss(logits, y)
+        else:
+            logits = model(x, return_embed=False)
+            loss = bce_loss(logits, y) + dice_loss(logits, y)
+
+        total_loss += float(loss.item()) * x.size(0)
+        n += x.size(0)
+
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        gts = y.detach().cpu().numpy()
+
+        B = probs.shape[0]
+        for i in range(B):
+            if tune_max_images > 0 and seen >= tune_max_images:
+                break
+            pr_prob = probs[i, 0]
+            gt_bin = (gts[i, 0] > 0.5).astype(np.uint8)
+
+            for thr in prob_thrs:
+                pr_bin = (pr_prob >= thr).astype(np.uint8)
+
+                tp, fp, fn, tn = pixel_confusion(gt_bin, pr_bin)
+                thr_conf[thr]["tp"] += tp
+                thr_conf[thr]["fp"] += fp
+                thr_conf[thr]["fn"] += fn
+                thr_conf[thr]["tn"] += tn
+
+                f2_img = kaggle_mean_f2_for_image(gt_bin, pr_bin, iou_thrs=iou_thrs, min_area=min_area)
+                thr_sum_f2[thr] += f2_img
+
+            seen += 1
+
+        if tune_max_images > 0 and seen >= tune_max_images:
+            break
+
+    val_loss = total_loss / max(n, 1)
+    denom = max(seen, 1)
+
+    thr_mean_f2 = {t: thr_sum_f2[t] / denom for t in prob_thrs}
+    thr_pix = {t: pixel_metrics_from_conf(**thr_conf[t]) for t in prob_thrs}
+
+    best_thr = prob_thrs[0]
+    best_f2 = thr_mean_f2[best_thr]
+    best_iou = thr_pix[best_thr]["IoU"]
+    for t in prob_thrs[1:]:
+        f2v = thr_mean_f2[t]
+        iouv = thr_pix[t]["IoU"]
+        if (f2v > best_f2) or (abs(f2v - best_f2) < 1e-12 and iouv > best_iou):
+            best_thr = t
+            best_f2 = f2v
+            best_iou = iouv
+
+    return val_loss, float(best_thr), float(best_f2), thr_pix[best_thr]
+
+@torch.no_grad()
+def eval_fixed_threshold(model, loader, device, use_amp: bool,
+                         prob_thr: float, iou_thrs: List[float],
+                         min_area: int) -> Tuple[float, Dict[str, float]]:
+    model.eval()
+    sum_f2 = 0.0
+    tp = fp = fn = tn = 0
+    n = 0
+
+    for batch in loader:
+        x = batch["image"].to(device, non_blocking=True)
+        y = batch["mask"].to(device, non_blocking=True)
+
+        if use_amp:
+            if AMP_NEW:
+                with amp_autocast(device_type="cuda"):
+                    logits = model(x, return_embed=False)
+            else:
+                with amp_autocast():
+                    logits = model(x, return_embed=False)
+        else:
+            logits = model(x, return_embed=False)
+
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        gts = y.detach().cpu().numpy()
+        B = probs.shape[0]
+        for i in range(B):
+            pr_prob = probs[i, 0]
+            gt_bin = (gts[i, 0] > 0.5).astype(np.uint8)
+            pr_bin = (pr_prob >= prob_thr).astype(np.uint8)
+
+            sum_f2 += kaggle_mean_f2_for_image(gt_bin, pr_bin, iou_thrs=iou_thrs, min_area=min_area)
+            tpi, fpi, fni, tni = pixel_confusion(gt_bin, pr_bin)
+            tp += tpi; fp += fpi; fn += fni; tn += tni
+            n += 1
+
+    kaggle_mean_f2 = sum_f2 / max(n, 1)
+    pix = pixel_metrics_from_conf(tp, fp, fn, tn)
+    return float(kaggle_mean_f2), pix
+
+
+# ---------------------------
+# Submission generation (Kaggle official test)
+# ---------------------------
+
+def find_kaggle_test_dir(kaggle_test_dir: Optional[str], kaggle_root: Optional[str]) -> Optional[str]:
+    candidates = []
+    if kaggle_test_dir is not None and os.path.isdir(kaggle_test_dir):
+        return kaggle_test_dir
+
+    if kaggle_root is not None and os.path.isdir(kaggle_root):
+        for name in ["test_v2", "test", "test_images", "images_test", "test_v2_full"]:
+            p = os.path.join(kaggle_root, name)
+            if os.path.isdir(p):
+                candidates.append(p)
+
+        subs = [os.path.join(kaggle_root, d) for d in os.listdir(kaggle_root)]
+        subs = [d for d in subs if os.path.isdir(d)]
+        for d in subs:
+            jpgs = glob.glob(os.path.join(d, "*.jpg"))
+            if len(jpgs) > 1000:
+                candidates.append(d)
+
+    candidates = sorted(list(set(candidates)))
+    for c in candidates:
+        if len(glob.glob(os.path.join(c, "*.jpg"))) > 0:
+            return c
+    return None
+
+@torch.no_grad()
+def generate_submission_csv(model, test_images_dir: str, device, use_amp: bool,
+                            prob_thr: float, resize: Optional[int],
+                            min_area: int, batch_size: int, num_workers: int,
+                            out_csv_path: str, logger: logging.Logger):
+    model.eval()
+    ds = ShipSegDataset(test_images_dir, masks_dir=None, resize=resize, augment=False, two_views=False)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=True)
+
+    rows = []
+    processed = 0
+
+    for batch in loader:
+        x = batch["image"].to(device, non_blocking=True)
+        image_ids = batch["image_id"]
+        orig_sizes = batch["orig_size"]
+
+        if use_amp:
+            if AMP_NEW:
+                with amp_autocast(device_type="cuda"):
+                    logits = model(x, return_embed=False)
+            else:
+                with amp_autocast():
+                    logits = model(x, return_embed=False)
+        else:
+            logits = model(x, return_embed=False)
+
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+
+        B = probs.shape[0]
+        for i in range(B):
+            image_id = image_ids[i]
+            pr_prob = probs[i, 0]
+            pr_bin = (pr_prob >= prob_thr).astype(np.uint8)
+
+            orig_h, orig_w = orig_sizes[i]
+            if resize is not None:
+                pr_img = Image.fromarray((pr_bin * 255).astype(np.uint8), mode="L")
+                pr_img = pr_img.resize((orig_w, orig_h), resample=Image.NEAREST)
+                pr_bin_full = (np.asarray(pr_img) > 127).astype(np.uint8)
+            else:
+                pr_bin_full = pr_bin
+
+            insts = mask_to_instances(pr_bin_full, min_area=min_area)
+
+            if len(insts) == 0:
+                rows.append((image_id, ""))
+            else:
+                for inst in insts:
+                    rle = rle_encode(inst)
+                    rows.append((image_id, rle))
+
+            processed += 1
+            if processed % 2000 == 0:
+                logger.info(f"[Submission] processed {processed}/{len(ds)} images...")
+
+    ensure_dir(os.path.dirname(out_csv_path))
+    with open(out_csv_path, "w", encoding="utf-8") as f:
+        f.write("ImageId,EncodedPixels\n")
+        for image_id, enc in rows:
+            f.write(f"{image_id},{enc}\n")
+
+    logger.info(f"[SUBMISSION] saved -> {out_csv_path} (rows={len(rows)})")
+
+
+# ---------------------------
+# Main
+# ---------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser("HRNetV2 baseline + pixel contrastive CL: ablation + curriculum_hard + kaggle submission")
+
+    p.add_argument("--split-dir", type=str, default=
+                   "/home/ougaishibashi/kaggle_competition/airbus-ship-detection/prepared_splits/"
+                   "SCALE_100PCT__TRAIN70_VAL15_TEST15__SEED42")
+    p.add_argument("--save-root", type=str, default=None,
+                   help="Root dir to save outputs. default: <split-dir>/runs_cl_ablation")
+
+    p.add_argument("--kaggle-test-dir", type=str, default=None,
+                   help="Path to Kaggle official test images (e.g., test_v2). If None, try auto-detect.")
+    p.add_argument("--kaggle-root", type=str, default="/home/ougaishibashi/kaggle_competition/airbus-ship-detection",
+                   help="Root folder to auto-detect test_v2 if --kaggle-test-dir not set.")
+
+    p.add_argument("--backbone", type=str, default="hrnet_w32.ms_in1k")
+    p.add_argument("--no-pretrained", action="store_true")
+    p.add_argument("--fuse-ch", type=int, default=64)
+    p.add_argument("--embed-dim", type=int, default=64)
+    p.add_argument("--dropout", type=float, default=0.1)
+
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--warmup-ratio", type=float, default=0.4,
+                   help="curriculum_hard: first warmup_ratio*epochs uses seg only (lambda=0), then seg+CL")
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--amp", action="store_true")
+
+    p.add_argument("--resize", type=int, default=None, help="Optional square resize (e.g., 512). default None")
+
+    p.add_argument("--prob-thrs", type=str, default="0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95")
+    p.add_argument("--iou-thrs", type=str, default="0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95")
+    p.add_argument("--tune-max-images", type=int, default=2000,
+                   help="0=all (very heavy on full val). recommended 2000-5000 for speed.")
+    p.add_argument("--min-area", type=int, default=0, help="Remove predicted instances smaller than this area.")
+
+    p.add_argument("--pos-weight", type=float, default=None,
+                   help="BCE pos_weight. If None, no weighting. (You can set e.g., 10.0)")
+
+    # CL params
+    p.add_argument("--mode", type=str, default="baseline",
+                   choices=["baseline", "cl_pos", "cl_neg", "cl_both"],
+                   help="Ablation mode.")
+    p.add_argument("--ablation", action="store_true",
+                   help="Run all modes: baseline, cl_pos, cl_neg, cl_both")
+    p.add_argument("--lam", type=float, default=0.30,
+                   help="CL weight lambda (will be clamped to <=0.3)")
+    p.add_argument("--validate-lam", action="store_true",
+                   help="Run lambda sweep to check if 0.3 is appropriate (per mode).")
+    p.add_argument("--lam-sweep", type=str, default="0.05,0.10,0.20,0.30",
+                   help="Lambda values for sweep when --validate-lam set.")
+
+    p.add_argument("--tau", type=float, default=0.2, help="Temperature for NT-Xent style CL.")
+    p.add_argument("--cl-samples-per-img", type=int, default=1024,
+                   help="Number of pixels sampled per image for CL (half pos/half neg by default).")
+    p.add_argument("--cl-use-boundary", action="store_true",
+                   help="If set, oversample boundary pixels for CL.")
+    p.add_argument("--cl-boundary-width", type=int, default=2,
+                   help="Boundary band width (pixels) for CL sampling.")
+    p.add_argument("--cl-boundary-ratio", type=float, default=0.7,
+                   help="Ratio of samples drawn from boundary (rest from random).")
+
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--deterministic", action="store_true")
+
+    p.add_argument("--resume", type=str, default=None,
+                   help="Path to checkpoint to resume (single run).")
+
+    return p.parse_args()
+
+def run_single(mode: str, lam: float, args, prob_thrs, iou_thrs):
+    split_dir = args.split_dir
+    save_root = args.save_root if args.save_root is not None else os.path.join(split_dir, "runs_cl_ablation")
+    ensure_dir(save_root)
+
+    # clamp lambda <= 0.3 as requested
+    lam = float(min(max(lam, 0.0), 0.3))
+
+    run_name = f"RUN__{now_str()}__mode={mode}__lam={lam:.3f}__{os.path.basename(split_dir)}"
+    save_dir = os.path.join(save_root, run_name)
+    ensure_dir(save_dir)
+
+    log_path = os.path.join(save_dir, "logs", f"{run_name}.log")
+    logger = setup_logger(log_path)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_amp = bool(args.amp and device == "cuda")
+    set_seed(args.seed, deterministic=args.deterministic)
+
+    train_images = os.path.join(split_dir, "train_images")
+    train_masks  = os.path.join(split_dir, "train_masks")
+    val_images   = os.path.join(split_dir, "val_images")
+    val_masks    = os.path.join(split_dir, "val_masks")
+    test_images  = os.path.join(split_dir, "test_images")
+    test_masks   = os.path.join(split_dir, "test_masks")
+
+    if not os.path.isdir(train_images) or not os.path.isdir(train_masks):
+        raise RuntimeError(f"Invalid split-dir. train_images/train_masks not found in: {split_dir}")
+
+    # two_views only needed for CL stage, but we can enable it for training dataset always when mode != baseline
+    two_views_train = (mode != "baseline")
+    ds_train = ShipSegDataset(train_images, train_masks, resize=args.resize, augment=True, two_views=two_views_train)
+    ds_val   = ShipSegDataset(val_images, val_masks, resize=args.resize, augment=False, two_views=False)
+
+    test_has_masks = os.path.isdir(test_masks)
+    ds_test  = ShipSegDataset(test_images, test_masks if test_has_masks else None,
+                              resize=args.resize, augment=False, two_views=False)
+
+    dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True,
+                          num_workers=args.num_workers, pin_memory=True, drop_last=False)
+    dl_val   = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False,
+                          num_workers=args.num_workers, pin_memory=True, drop_last=False)
+    dl_test  = DataLoader(ds_test, batch_size=args.batch_size, shuffle=False,
+                          num_workers=args.num_workers, pin_memory=True, drop_last=False)
+
+    model = HRNetSegCL(
+        backbone_name=args.backbone,
+        pretrained=(not args.no_pretrained),
+        fuse_ch=args.fuse_ch,
+        embed_dim=args.embed_dim,
+        dropout=args.dropout,
+    ).to(device)
+
+    # Initialize LazyConv2d before optimizer (dummy forward)
+    dummy_hw = args.resize if args.resize is not None else 768
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, dummy_hw, dummy_hw, device=device)
+        _ = model(dummy, return_embed=False)
+
+    if args.pos_weight is not None:
+        pos_weight_tensor = torch.tensor([args.pos_weight], dtype=torch.float32, device=device)
+        bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+    else:
+        bce_loss = nn.BCEWithLogitsLoss()
+    dice_loss = DiceLoss()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    scaler = AmpGradScaler("cuda") if (use_amp and AMP_NEW) else (AmpGradScaler() if use_amp else None)
+
+    warmup_epochs = int(round(args.epochs * float(args.warmup_ratio)))
+    warmup_epochs = max(min(warmup_epochs, args.epochs), 0)
+
+    start_epoch = 1
+    best_val_f2 = -1.0
+    best_thr = prob_thrs[-1]
+
+    ckpt_dir = os.path.join(save_dir, "checkpoints")
+    ensure_dir(ckpt_dir)
+
+    best_path = os.path.join(save_dir, "BEST__model.pth")
+    best_thr_path = os.path.join(save_dir, "BEST__prob_threshold.json")
+    report_path = os.path.join(save_dir, "REPORT__val_test_metrics.json")
+
+    # Resume (single run)
+    if args.resume is not None and os.path.isfile(args.resume):
+        ckpt = torch.load(args.resume, map_location="cpu")
+        model.load_state_dict(ckpt["model"], strict=True)
+        optimizer.load_state_dict(ckpt["optim"])
+        scheduler.load_state_dict(ckpt["sched"])
+        if scaler is not None and "scaler" in ckpt and ckpt["scaler"] is not None:
+            scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_val_f2 = float(ckpt.get("best_val_f2", best_val_f2))
+        best_thr = float(ckpt.get("best_thr", best_thr))
+        logger.info(f"[Resume] from {args.resume} -> start_epoch={start_epoch}, best_val_f2={best_val_f2:.4f}, best_thr={best_thr:.2f}")
+
+    logger.info("=== CONFIG ===")
+    logger.info(f"split_dir      = {split_dir}")
+    logger.info(f"save_dir       = {save_dir}")
+    logger.info(f"log_path       = {log_path}")
+    logger.info(f"device         = {device} | amp={use_amp}")
+    logger.info(f"backbone       = {args.backbone} | pretrained={not args.no_pretrained}")
+    logger.info(f"fuse_ch        = {args.fuse_ch} | embed_dim={args.embed_dim} | dropout={args.dropout}")
+    logger.info(f"mode           = {mode}")
+    logger.info(f"epochs         = {args.epochs} | warmup_epochs={warmup_epochs} (ratio={args.warmup_ratio})")
+    logger.info(f"lr             = {args.lr} | weight_decay={args.weight_decay}")
+    logger.info(f"resize         = {args.resize}")
+    logger.info(f"seed           = {args.seed} | deterministic={args.deterministic}")
+    logger.info(f"min_area       = {args.min_area}")
+    logger.info(f"pos_weight     = {args.pos_weight}")
+    logger.info(f"lambda(lam)    = {lam:.3f} (clamped to <=0.3)")
+    logger.info(f"tau            = {args.tau}")
+    logger.info(f"cl_samples/img = {args.cl_samples_per_img}")
+    logger.info(f"cl_use_boundary= {args.cl_use_boundary} | width={args.cl_boundary_width} | ratio={args.cl_boundary_ratio}")
+    logger.info(f"prob_thrs      = {prob_thrs}")
+    logger.info(f"iou_thrs       = {iou_thrs}")
+    logger.info(f"tune_max_images= {args.tune_max_images} (0=all)")
+    logger.info(f"n_train={len(ds_train)} n_val={len(ds_val)} n_test={len(ds_test)} test_has_masks={test_has_masks}")
+    logger.info("==============")
+
+    logger.info("=== TRAIN START ===")
+    history = []
+
+    for ep in range(start_epoch, args.epochs + 1):
+        t_ep0 = time.time()
+        lam_eff = curriculum_hard_lambda(ep, warmup_epochs, lam if mode != "baseline" else 0.0)
+
+        train_loss, train_cl = train_one_epoch(
+            model=model,
+            loader=dl_train,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            use_amp=use_amp,
+            bce_loss=bce_loss,
+            dice_loss=dice_loss,
+            cl_mode=mode if mode != "baseline" else "cl_both",
+            lam_eff=lam_eff,
+            tau=args.tau,
+            cl_samples_per_img=args.cl_samples_per_img,
+            cl_use_boundary=args.cl_use_boundary,
+            cl_boundary_width=args.cl_boundary_width,
+            cl_boundary_ratio=args.cl_boundary_ratio,
+            logger=logger,
+            epoch=ep,
+            epochs=args.epochs,
+            log_interval=200
+        )
+
+        val_loss, tuned_thr, val_kaggle_f2, val_pixel = eval_and_tune_threshold(
+            model=model,
+            loader=dl_val,
+            device=device,
+            use_amp=use_amp,
+            bce_loss=bce_loss,
+            dice_loss=dice_loss,
+            prob_thrs=prob_thrs,
+            iou_thrs=iou_thrs,
+            tune_max_images=args.tune_max_images,
+            min_area=args.min_area,
+            logger=logger
+        )
+
+        scheduler.step()
+
+        elapsed = time.time() - t_ep0
+        logger.info(
+            f"[Epoch {ep:03d}/{args.epochs:03d}] time={elapsed:.1f}s "
+            f"lam_eff={lam_eff:.3f} train_loss={train_loss:.4f} train_cl={train_cl:.4f} "
+            f"val_loss={val_loss:.4f} "
+            f"VAL KaggleMeanF2={val_kaggle_f2:.4f} (prob_thr={tuned_thr:.2f}, tuned_on={args.tune_max_images if args.tune_max_images>0 else len(ds_val)}) | "
+            f"pixel(F2={val_pixel['F2']:.4f}, IoU={val_pixel['IoU']:.4f}, P={val_pixel['precision']:.4f}, R={val_pixel['recall']:.4f}, Kappa={val_pixel['kappa']:.4f})"
+        )
+
+        ckpt_path = os.path.join(ckpt_dir, f"ckpt_ep{ep:03d}.pth")
+        torch.save({
+            "epoch": ep,
+            "model": model.state_dict(),
+            "optim": optimizer.state_dict(),
+            "sched": scheduler.state_dict(),
+            "scaler": (scaler.state_dict() if scaler is not None else None),
+            "best_val_f2": best_val_f2,
+            "best_thr": best_thr,
+            "mode": mode,
+            "lam": lam,
+            "lam_eff": lam_eff,
+            "args": vars(args),
+        }, ckpt_path)
+
+        if val_kaggle_f2 > best_val_f2:
+            best_val_f2 = val_kaggle_f2
+            best_thr = tuned_thr
+            torch.save(model.state_dict(), best_path)
+            save_json(best_thr_path, {"prob_thr": best_thr, "best_val_kaggle_mean_f2": best_val_f2, "epoch": ep})
+            logger.info(f"[BEST UPDATE] epoch={ep} val_kaggle_mean_f2={best_val_f2:.4f} prob_thr={best_thr:.2f} | saved: {os.path.basename(best_path)}, {os.path.basename(best_thr_path)}")
+
+        history.append({
+            "epoch": ep,
+            "lam_eff": lam_eff,
+            "train_loss": float(train_loss),
+            "train_cl": float(train_cl),
+            "val_loss": float(val_loss),
+            "val_kaggle_mean_f2": float(val_kaggle_f2),
+            "tuned_thr": float(tuned_thr),
+            "val_pixel": val_pixel
+        })
+        save_json(os.path.join(save_dir, "history.json"), {"history": history})
+
+    logger.info("=== TRAIN DONE ===")
+    logger.info(f"BEST val_kaggle_mean_f2={best_val_f2:.4f} best_prob_thr={best_thr:.2f}")
+    logger.info("=== FINAL EVAL (load best) ===")
+
+    if os.path.isfile(best_path):
+        model.load_state_dict(torch.load(best_path, map_location="cpu"), strict=True)
+    else:
+        logger.info("[WARN] BEST weight not found; using last epoch weights.")
+
+    val_f2, val_pix = eval_fixed_threshold(model, dl_val, device, use_amp,
+                                           prob_thr=best_thr, iou_thrs=iou_thrs, min_area=args.min_area)
+    logger.info(f"[VAL ] KaggleMeanF2={val_f2:.4f} | pixel(F2={val_pix['F2']:.4f}, IoU={val_pix['IoU']:.4f}, P={val_pix['precision']:.4f}, R={val_pix['recall']:.4f}, Kappa={val_pix['kappa']:.4f})")
+
+    if test_has_masks:
+        test_f2, test_pix = eval_fixed_threshold(model, dl_test, device, use_amp,
+                                                 prob_thr=best_thr, iou_thrs=iou_thrs, min_area=args.min_area)
+        logger.info(f"[TEST] KaggleMeanF2={test_f2:.4f} | pixel(F2={test_pix['F2']:.4f}, IoU={test_pix['IoU']:.4f}, P={test_pix['precision']:.4f}, R={test_pix['recall']:.4f}, Kappa={test_pix['kappa']:.4f})")
+    else:
+        test_f2, test_pix = None, None
+        logger.info("[TEST] test_masks not found -> skip local test evaluation")
+
+    report = {
+        "split_dir": split_dir,
+        "save_dir": save_dir,
+        "mode": mode,
+        "lam": lam,
+        "best": {
+            "best_val_kaggle_mean_f2": best_val_f2,
+            "best_prob_thr": best_thr,
+        },
+        "val": {
+            "kaggle_mean_f2": val_f2,
+            "pixel": val_pix,
+        },
+        "test": {
+            "has_masks": bool(test_has_masks),
+            "kaggle_mean_f2": test_f2,
+            "pixel": test_pix,
+        }
+    }
+    save_json(report_path, report)
+    logger.info(f"[REPORT] saved -> {report_path}")
+
+    # submission
+    logger.info("=== SUBMISSION GENERATION ===")
+    official_test_dir = find_kaggle_test_dir(args.kaggle_test_dir, args.kaggle_root)
+    if official_test_dir is None:
+        logger.info("[WARN] Kaggle official test dir not found. Set --kaggle-test-dir explicitly to generate submission.")
+        logger.info("=== DONE ===")
+        return report
+
+    sub_path = os.path.join(save_dir, f"SUBMISSION__HRNetV2__mode={mode}__lam={lam:.3f}.csv")
+    generate_submission_csv(
+        model=model,
+        test_images_dir=official_test_dir,
+        device=device,
+        use_amp=use_amp,
+        prob_thr=best_thr,
+        resize=args.resize,
+        min_area=args.min_area,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        out_csv_path=sub_path,
+        logger=logger
+    )
+    logger.info("=== DONE ===")
+    return report
+
+def main():
+    args = parse_args()
+
+    prob_thrs = [float(x) for x in args.prob_thrs.split(",")]
+    iou_thrs  = [float(x) for x in args.iou_thrs.split(",")]
+
+    modes = ["baseline", "cl_pos", "cl_neg", "cl_both"] if args.ablation else [args.mode]
+
+    if args.validate_lam:
+        lam_list = [float(x) for x in args.lam_sweep.split(",")]
+        lam_list = [min(max(l, 0.0), 0.3) for l in lam_list]
+    else:
+        lam_list = [float(min(max(args.lam, 0.0), 0.3))]
+
+    all_reports = []
+    for mode in modes:
+        # baseline: force lam=0 (still respects curriculum, but CL off)
+        if mode == "baseline":
+            rep = run_single(mode=mode, lam=0.0, args=args, prob_thrs=prob_thrs, iou_thrs=iou_thrs)
+            all_reports.append(rep)
+            continue
+
+        if args.validate_lam:
+            mode_reports = []
+            for lam in lam_list:
+                rep = run_single(mode=mode, lam=lam, args=args, prob_thrs=prob_thrs, iou_thrs=iou_thrs)
+                mode_reports.append(rep)
+
+            # summary for lambda sweep
+            # choose best by val kaggle mean f2
+            best_idx = int(np.argmax([r["val"]["kaggle_mean_f2"] for r in mode_reports]))
+            best_rep = mode_reports[best_idx]
+            all_reports.extend(mode_reports)
+
+            # Also save a concise sweep summary
+            split_dir = args.split_dir
+            save_root = args.save_root if args.save_root is not None else os.path.join(split_dir, "runs_cl_ablation")
+            sweep_summary_path = os.path.join(save_root, f"SWEEP_SUMMARY__{now_str()}__mode={mode}.json")
+            save_json(sweep_summary_path, {
+                "mode": mode,
+                "lambda_list": lam_list,
+                "reports": mode_reports,
+                "best_by_val_kaggle_mean_f2": {
+                    "lam": best_rep["lam"],
+                    "save_dir": best_rep["save_dir"],
+                    "val_kaggle_mean_f2": best_rep["val"]["kaggle_mean_f2"],
+                    "best_prob_thr": best_rep["best"]["best_prob_thr"],
+                }
+            })
+            print(f"[SWEEP SUMMARY] saved -> {sweep_summary_path}")
+
+        else:
+            rep = run_single(mode=mode, lam=lam_list[0], args=args, prob_thrs=prob_thrs, iou_thrs=iou_thrs)
+            all_reports.append(rep)
+
+    # Save global summary
+    split_dir = args.split_dir
+    save_root = args.save_root if args.save_root is not None else os.path.join(split_dir, "runs_cl_ablation")
+    summary_path = os.path.join(save_root, f"GLOBAL_SUMMARY__{now_str()}.json")
+    save_json(summary_path, {"reports": all_reports})
+    print(f"[GLOBAL SUMMARY] saved -> {summary_path}")
+
+if __name__ == "__main__":
+    main()
