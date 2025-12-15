@@ -1,0 +1,511 @@
+# =========================
+# ONE-CELL Kaggle Runner:
+# env fix -> path detect -> safe template submission -> (optional) train -> infer -> template-aligned submission
+# =========================
+
+import os
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["TRANSFORMERS_NO_FLAX"] = "1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import glob
+import random
+import time
+import json
+import logging
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms.functional as TF
+
+# ---- AMP (new API if available) ----
+try:
+    from torch.amp import autocast, GradScaler
+    _AMP_NEW = True
+except Exception:
+    autocast = torch.cuda.amp.autocast
+    GradScaler = torch.cuda.amp.GradScaler
+    _AMP_NEW = False
+
+from transformers import SegformerForSemanticSegmentation
+
+# -------------------------
+# CONFIG (ここだけ必要なら変える)
+# -------------------------
+SEED = 42
+MODEL_NAME = "nvidia/mit-b0"
+IMG_SIZE = 384
+
+# 「一旦提出したい」最優先なら True を推奨（学習・推論をスキップして“空マスク提出”を即生成）
+QUICK_EMPTY_SUBMISSION_ONLY = False
+
+# 軽く学習してから提出したい場合の設定（重いなら下げる）
+EPOCHS = 1
+BATCH_SIZE = 4
+LR = 5e-5
+WEIGHT_DECAY = 0.01
+MAX_TRAIN_IMAGES = 2000  # 0なら全件
+MAX_VAL_IMAGES   = 400   # 0なら全件
+PREFER_POSITIVE = True
+POS_RATIO = 0.6
+THR_GRID = [0.2,0.3,0.4,0.5,0.6,0.7,0.8]
+
+# 提出ファイルパス
+SUB_PATH = "/kaggle/working/submission.csv"
+LOG_PATH = "/kaggle/working/run_all_onecell.log"
+
+# -------------------------
+# LOGGER
+# -------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_PATH)]
+)
+logger = logging.getLogger("onecell")
+
+# -------------------------
+# REPRO / DEVICE
+# -------------------------
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"DEVICE={DEVICE}")
+
+# -------------------------
+# PATH AUTO-DETECT
+# -------------------------
+def find_airbus_paths(root="/kaggle/input"):
+    hits = glob.glob(os.path.join(root, "**", "train_ship_segmentations_v2.csv"), recursive=True)
+    if not hits:
+        print("[ERROR] train_ship_segmentations_v2.csv not found under /kaggle/input")
+        print("  -> Kaggle右側の 'Add data' で Airbus Ship Detection データを追加してください。")
+        print("  -> /kaggle/input listing:", sorted(os.listdir(root)) if os.path.exists(root) else "N/A")
+        return None
+    train_csv = hits[0]
+    data_dir = os.path.dirname(train_csv)
+
+    sample_sub = os.path.join(data_dir, "sample_submission_v2.csv")
+    train_dir = os.path.join(data_dir, "train_v2")
+    test_dir  = os.path.join(data_dir, "test_v2")
+
+    # fallback search (rare)
+    if not os.path.exists(sample_sub):
+        ss = glob.glob(os.path.join(data_dir, "**", "sample_submission_v2.csv"), recursive=True)
+        if ss: sample_sub = ss[0]
+    if not os.path.isdir(train_dir):
+        td = glob.glob(os.path.join(data_dir, "**", "train_v2"), recursive=True)
+        if td: train_dir = td[0]
+    if not os.path.isdir(test_dir):
+        td = glob.glob(os.path.join(data_dir, "**", "test_v2"), recursive=True)
+        if td: test_dir = td[0]
+
+    need = [train_csv, sample_sub, train_dir, test_dir]
+    if not all(os.path.exists(p) for p in need):
+        print("[ERROR] Airbus paths detected but some are missing.")
+        print("data_dir:", data_dir)
+        for p in need:
+            print(" ", p, "exists=", os.path.exists(p))
+        return None
+
+    return {
+        "DATA_DIR": data_dir,
+        "TRAIN_CSV": train_csv,
+        "SAMPLE_SUB_CSV": sample_sub,
+        "TRAIN_IMG_DIR": train_dir,
+        "TEST_IMG_DIR": test_dir
+    }
+
+paths = find_airbus_paths()
+if paths is None:
+    raise SystemExit("Airbus data not found. Add data and rerun.")
+
+logger.info("=== DETECTED PATHS ===")
+for k,v in paths.items():
+    logger.info(f"{k}: {v}")
+
+TRAIN_CSV = paths["TRAIN_CSV"]
+SAMPLE_SUB_CSV = paths["SAMPLE_SUB_CSV"]
+TRAIN_IMG_DIR = paths["TRAIN_IMG_DIR"]
+TEST_IMG_DIR  = paths["TEST_IMG_DIR"]
+
+# -------------------------
+# RLE (Airbus: Fortran order)  <-- ここが仕様の要
+# -------------------------
+def rle_decode(rle: str, shape: Tuple[int, int]) -> np.ndarray:
+    H, W = shape
+    if rle is None or rle == "" or (isinstance(rle, float) and np.isnan(rle)):
+        return np.zeros((H, W), dtype=np.uint8)
+    s = rle.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    img = np.zeros(H * W, dtype=np.uint8)
+    for st, en in zip(starts, ends):
+        img[st:en] = 1
+    return img.reshape((H, W), order="F")
+
+def rle_encode(mask: np.ndarray) -> str:
+    if mask is None:
+        return ""
+    m = mask.astype(np.uint8)
+    if m.max() == 0:
+        return ""
+    pixels = m.flatten(order="F")
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+# -------------------------
+# TEMPLATE: sample_submission に完全一致するCSVを「先に」必ず作る（空マスク）
+#  -> “File appears to be empty” を絶対回避する保険
+# -------------------------
+template = pd.read_csv(SAMPLE_SUB_CSV)
+if "ImageId" not in template.columns:
+    raise ValueError("sample_submission_v2.csv has no ImageId column.")
+if "EncodedPixels" not in template.columns:
+    # たまに列名が違うケースに備えて救済
+    # ただしAirbusは通常 EncodedPixels
+    template["EncodedPixels"] = ""
+
+template["EncodedPixels"] = ""  # 空マスク
+template.to_csv(SUB_PATH, index=False)
+
+# 0バイト回避チェック
+if (not os.path.exists(SUB_PATH)) or os.path.getsize(SUB_PATH) == 0:
+    raise RuntimeError("submission.csv was not created or is empty (0 bytes).")
+
+logger.info(f"[SAFE] Wrote template-aligned empty submission first: {SUB_PATH} rows={len(template)} bytes={os.path.getsize(SUB_PATH)}")
+
+# ここで “一旦提出したい（形式だけ通したい）” 場合は終了可能
+if QUICK_EMPTY_SUBMISSION_ONLY:
+    logger.info("QUICK_EMPTY_SUBMISSION_ONLY=True -> stop here. submission.csv is ready.")
+    print("READY:", SUB_PATH, "rows=", len(template), "bytes=", os.path.getsize(SUB_PATH))
+    print(template.head())
+    raise SystemExit(0)
+
+# -------------------------
+# BUILD TRAIN INDEX
+# -------------------------
+df = pd.read_csv(TRAIN_CSV)
+IMG2RLES: Dict[str, List[str]] = {}
+for img_id, g in df.groupby("ImageId"):
+    IMG2RLES[img_id] = g["EncodedPixels"].dropna().tolist()
+ALL_TRAIN_IDS = list(IMG2RLES.keys())
+
+def is_positive(img_id: str) -> bool:
+    return len(IMG2RLES.get(img_id, [])) > 0
+
+def train_val_split(ids, val_ratio=0.15, seed=42):
+    rng = np.random.RandomState(seed)
+    ids = ids.copy()
+    rng.shuffle(ids)
+    n_val = int(len(ids) * val_ratio)
+    return ids[n_val:], ids[:n_val]
+
+def subsample_ids(ids, max_n, prefer_positive, pos_ratio, seed):
+    if max_n is None or max_n <= 0 or max_n >= len(ids):
+        return ids
+    rng = np.random.RandomState(seed)
+    if not prefer_positive:
+        rng.shuffle(ids)
+        return ids[:max_n]
+    pos = [x for x in ids if is_positive(x)]
+    neg = [x for x in ids if not is_positive(x)]
+    rng.shuffle(pos); rng.shuffle(neg)
+    n_pos = int(max_n * pos_ratio)
+    n_neg = max_n - n_pos
+    out = pos[:min(n_pos, len(pos))] + neg[:min(n_neg, len(neg))]
+    remain = [x for x in ids if x not in set(out)]
+    rng.shuffle(remain)
+    need = max_n - len(out)
+    if need > 0:
+        out += remain[:need]
+    rng.shuffle(out)
+    return out
+
+train_ids, val_ids = train_val_split(ALL_TRAIN_IDS, val_ratio=0.15, seed=SEED)
+train_ids = subsample_ids(train_ids, MAX_TRAIN_IMAGES, PREFER_POSITIVE, POS_RATIO, SEED)
+val_ids   = subsample_ids(val_ids,   MAX_VAL_IMAGES,   False,          POS_RATIO, SEED)
+
+logger.info(f"train_ids={len(train_ids)} pos={sum(is_positive(x) for x in train_ids)}")
+logger.info(f"val_ids  ={len(val_ids)} pos={sum(is_positive(x) for x in val_ids)}")
+
+# -------------------------
+# DATASET / LOADER
+# -------------------------
+MEAN = (0.485,0.456,0.406)
+STD  = (0.229,0.224,0.225)
+
+class ShipSegDataset(Dataset):
+    def __init__(self, img_dir, ids, img2rles, img_size=384, training=True):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.img2rles = img2rles
+        self.img_size = img_size
+        self.training = training
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        img_id = self.ids[idx]
+        path = os.path.join(self.img_dir, img_id)
+        img = Image.open(path).convert("RGB")
+        H, W = img.size[1], img.size[0]
+
+        rles = self.img2rles.get(img_id, [])
+        mask = np.zeros((H, W), dtype=np.uint8)
+        for rle in rles:
+            mask |= rle_decode(rle, (H, W))
+
+        # resize
+        img = img.resize((self.img_size, self.img_size), resample=Image.BILINEAR)
+        mask = Image.fromarray(mask*255).resize((self.img_size, self.img_size), resample=Image.NEAREST)
+        mask = (np.array(mask) > 127).astype(np.uint8)
+
+        # aug
+        if self.training:
+            if random.random() < 0.5:
+                img = TF.hflip(img); mask = np.fliplr(mask).copy()
+            if random.random() < 0.5:
+                img = TF.vflip(img); mask = np.flipud(mask).copy()
+
+        x = TF.to_tensor(img)
+        x = TF.normalize(x, MEAN, STD)
+        y = torch.from_numpy(mask).long()
+        return {"image_id": img_id, "pixel_values": x, "labels": y}
+
+def collate_fn(batch):
+    x = torch.stack([b["pixel_values"] for b in batch], dim=0)
+    y = torch.stack([b["labels"] for b in batch], dim=0)
+    ids = [b["image_id"] for b in batch]
+    return {"image_ids": ids, "pixel_values": x, "labels": y}
+
+train_ds = ShipSegDataset(TRAIN_IMG_DIR, train_ids, IMG2RLES, img_size=IMG_SIZE, training=True)
+val_ds   = ShipSegDataset(TRAIN_IMG_DIR, val_ids,   IMG2RLES, img_size=IMG_SIZE, training=False)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True, collate_fn=collate_fn)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate_fn)
+
+logger.info(f"steps/epoch: train={len(train_loader)} val={len(val_loader)}")
+
+# -------------------------
+# MODEL / LOSS / OPT
+# -------------------------
+def build_model():
+    try:
+        m = SegformerForSemanticSegmentation.from_pretrained(
+            MODEL_NAME, num_labels=2, ignore_mismatched_sizes=True
+        )
+        logger.info("Loaded pretrained SegFormer (HF).")
+        return m
+    except Exception as e:
+        logger.warning(f"from_pretrained failed -> random init. err={repr(e)}")
+        from transformers import SegformerConfig
+        cfg = SegformerConfig(num_labels=2)
+        return SegformerForSemanticSegmentation(cfg)
+
+model = build_model().to(DEVICE)
+ce_loss = nn.CrossEntropyLoss()
+
+def dice_loss_from_logits(logits, targets, eps=1e-6):
+    probs = torch.softmax(logits, dim=1)[:,1]
+    tgt = targets.float()
+    num = 2.0*(probs*tgt).sum(dim=(1,2))
+    den = (probs**2).sum(dim=(1,2)) + (tgt**2).sum(dim=(1,2)) + eps
+    return (1.0 - (num/den)).mean()
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+if _AMP_NEW:
+    scaler = GradScaler("cuda", enabled=(DEVICE.type=="cuda"))
+else:
+    scaler = GradScaler(enabled=(DEVICE.type=="cuda"))
+
+# -------------------------
+# EVAL (pixel F2) & THR TUNING (軽量)
+# -------------------------
+def compute_confusion(pred, gt):
+    tp = int(((pred==1)&(gt==1)).sum())
+    fp = int(((pred==1)&(gt==0)).sum())
+    fn = int(((pred==0)&(gt==1)).sum())
+    tn = int(((pred==0)&(gt==0)).sum())
+    return tp,fp,fn,tn
+
+def metrics_from_conf(tp,fp,fn,tn,beta=2.0,eps=1e-9):
+    precision = tp/(tp+fp+eps)
+    recall = tp/(tp+fn+eps)
+    iou = tp/(tp+fp+fn+eps)
+    f2 = (1+beta**2)*precision*recall/(beta**2*precision+recall+eps)
+    return {"precision":float(precision),"recall":float(recall),"iou":float(iou),"f2":float(f2)}
+
+@torch.no_grad()
+def eval_thr(thr):
+    model.eval()
+    TP=FP=FN=TN=0
+    for batch in val_loader:
+        x = batch["pixel_values"].to(DEVICE)
+        y = batch["labels"].cpu().numpy()
+        if _AMP_NEW:
+            with autocast(device_type="cuda", enabled=(DEVICE.type=="cuda")):
+                logits = model(pixel_values=x).logits
+        else:
+            with autocast(enabled=(DEVICE.type=="cuda")):
+                logits = model(pixel_values=x).logits
+        logits = F.interpolate(logits, size=y.shape[-2:], mode="bilinear", align_corners=False)
+        prob = torch.softmax(logits, dim=1)[:,1].detach().cpu().numpy()
+        pred = (prob >= thr).astype(np.uint8)
+        for i in range(pred.shape[0]):
+            tp,fp,fn,tn = compute_confusion(pred[i], y[i].astype(np.uint8))
+            TP+=tp; FP+=fp; FN+=fn; TN+=tn
+    return metrics_from_conf(TP,FP,FN,TN)
+
+@torch.no_grad()
+def tune_thr():
+    best_thr = 0.5
+    best_m = None
+    for t in THR_GRID:
+        m = eval_thr(t)
+        if best_m is None or m["f2"] > best_m["f2"]:
+            best_m = m
+            best_thr = t
+    return best_thr, best_m
+
+# -------------------------
+# TRAIN (軽く)
+# -------------------------
+best_thr = 0.5
+if EPOCHS > 0 and len(train_loader) > 0:
+    for epoch in range(1, EPOCHS+1):
+        model.train()
+        t0 = time.time()
+        total = 0.0
+        n = 0
+
+        for batch in train_loader:
+            x = batch["pixel_values"].to(DEVICE)
+            y = batch["labels"].to(DEVICE)
+
+            optimizer.zero_grad(set_to_none=True)
+            if _AMP_NEW:
+                with autocast(device_type="cuda", enabled=(DEVICE.type=="cuda")):
+                    logits = model(pixel_values=x).logits
+                    logits = F.interpolate(logits, size=y.shape[-2:], mode="bilinear", align_corners=False)
+                    loss = ce_loss(logits, y) + dice_loss_from_logits(logits, y)
+            else:
+                with autocast(enabled=(DEVICE.type=="cuda")):
+                    logits = model(pixel_values=x).logits
+                    logits = F.interpolate(logits, size=y.shape[-2:], mode="bilinear", align_corners=False)
+                    loss = ce_loss(logits, y) + dice_loss_from_logits(logits, y)
+
+            if (DEVICE.type=="cuda"):
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            total += float(loss.item())
+            n += 1
+
+        train_loss = total / max(1, n)
+        thr, m = tune_thr() if len(val_loader) > 0 else (0.5, {"f2":0.0,"iou":0.0,"precision":0.0,"recall":0.0})
+        best_thr = thr
+        dt = time.time() - t0
+        logger.info(f"[Epoch {epoch:03d}/{EPOCHS:03d}] time={dt:.1f}s train_loss={train_loss:.4f} | VAL thr={thr:.2f} F2={m['f2']:.4f} IoU={m['iou']:.4f} P={m['precision']:.4f} R={m['recall']:.4f}")
+else:
+    logger.warning("Skipped training (EPOCHS==0 or empty train_loader).")
+
+# -------------------------
+# INFERENCE on TEST (template-aligned)
+#   - テンプレの行数・順序を完全保持
+#   - 同一ImageIdがテンプレ内に複数行あっても同じ予測を流用
+# -------------------------
+@torch.no_grad()
+def predict_mask_for_image(img: Image.Image, thr: float) -> np.ndarray:
+    img = img.convert("RGB")
+    orig_w, orig_h = img.size
+    img_r = img.resize((IMG_SIZE, IMG_SIZE), resample=Image.BILINEAR)
+    x = TF.to_tensor(img_r)
+    x = TF.normalize(x, MEAN, STD).unsqueeze(0).to(DEVICE)
+
+    if _AMP_NEW:
+        with autocast(device_type="cuda", enabled=(DEVICE.type=="cuda")):
+            logits = model(pixel_values=x).logits
+    else:
+        with autocast(enabled=(DEVICE.type=="cuda")):
+            logits = model(pixel_values=x).logits
+
+    logits = F.interpolate(logits, size=(IMG_SIZE, IMG_SIZE), mode="bilinear", align_corners=False)
+    prob = torch.softmax(logits, dim=1)[:,1].squeeze(0).detach().cpu().numpy()
+    pred = (prob >= thr).astype(np.uint8)
+
+    # back to original size
+    pred_img = Image.fromarray(pred*255).resize((orig_w, orig_h), resample=Image.NEAREST)
+    pred = (np.array(pred_img) > 127).astype(np.uint8)
+    return pred
+
+model.eval()
+
+unique_ids = template["ImageId"].astype(str).unique().tolist()
+logger.info(f"Template rows={len(template)} unique ImageId={len(unique_ids)}")
+logger.info("Start inference (may take time if full test).")
+
+pred_rle: Dict[str, str] = {}
+
+# 失敗しても提出を壊さないため、例外は握りつぶして空にする（提出形式最優先）
+for idx, img_id in enumerate(unique_ids):
+    try:
+        img_path = os.path.join(TEST_IMG_DIR, img_id)
+        img = Image.open(img_path).convert("RGB")
+        mask = predict_mask_for_image(img, best_thr)
+        pred_rle[img_id] = rle_encode(mask)
+    except Exception as e:
+        pred_rle[img_id] = ""
+        if idx < 10:
+            logger.warning(f"infer failed for {img_id}: {repr(e)}")
+
+    if (idx + 1) % 1000 == 0:
+        logger.info(f"infer progress: {idx+1}/{len(unique_ids)}")
+
+# fill template in the same order/rows
+out = template.copy()
+out["EncodedPixels"] = out["ImageId"].astype(str).map(pred_rle).fillna("")
+
+out.to_csv(SUB_PATH, index=False)
+
+# -------------------------
+# FINAL SANITY CHECK: non-empty file, correct row count
+# -------------------------
+size = os.path.getsize(SUB_PATH) if os.path.exists(SUB_PATH) else 0
+logger.info(f"[DONE] Wrote submission: {SUB_PATH} rows={len(out)} bytes={size}")
+
+if size == 0:
+    raise RuntimeError("submission.csv is empty (0 bytes). Something is seriously wrong with the runtime.")
+
+# Quick stats
+non_empty = (out["EncodedPixels"].astype(str).str.len() > 0).sum()
+print("READY:", SUB_PATH)
+print("rows:", len(out), "template_rows:", len(template), "bytes:", size, "non_empty_predictions:", int(non_empty))
+print(out.head())
+
+# (念のため) 先頭数行をバイナリで確認（空提出事故の検知）
+with open(SUB_PATH, "rb") as f:
+    head_bytes = f.read(64)
+print("file head bytes:", head_bytes)
+print("LOG:", LOG_PATH)
