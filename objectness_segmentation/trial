@@ -1,0 +1,1015 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+  command
+pip install -U ultralytics scipy pillow
+
+python3 ship_yolo_objectness_unet_quarter.py \
+  --epochs 4 \
+  --batch-size 8 \
+  --eval-batch-size 8 \
+  --split-dir /home/ougaishibashi/kaggle_competition/airbus-ship-detection/prepared_splits/airbus_dataset_quarter \
+  --save-dir /home/ougaishibashi/kaggle_competition/airbus-ship-detection/runs/yolo_obj_unet_quarter \
+  --yolo-weights /path/to/yolov8n.pt
+"""
+
+
+"""
+YOLO objectness -> U-Net segmentation (quarter split) for Kaggle Airbus Ship Detection.
+
+目的:
+  - YOLOで objectness heatmap (1ch) を作り、U-Net(4ch: RGB+obj) でセグ学習
+  - メモリ節約のため YOLOは推論のみ + 事前キャッシュ
+  - 提出RLEは元解像度(通常768x768)で生成（ここを間違えると評価が壊れる）
+
+検証（妥当性チェック）:
+  - objがGT船領域をどれだけカバーしているか（hit rate）
+  - 背景で obj がどれだけ立っているか（false alarm rate）
+  - 目視用の可視化（RGB/obj/GT/overlay）を保存
+
+注意:
+  - COCO事前学習の yolov8n.pt は衛星船に反応しない可能性がある。
+    その場合、この方式の妥当性は低い（このスクリプトの sanity check で検出できる）。
+  - ultralytics が重みをDLしようとする場合があるので、ローカル運用なら
+    yolov8n.pt を事前配置して --yolo-weights で明示指定推奨。
+
+想定split構造:
+  split_dir/
+    train/images/*.jpg, train/masks/*.png
+    val/images/*.jpg,   val/masks/*.png
+    test/images/*.jpg   (masks無しでOK)
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import glob
+import argparse
+import logging
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+# connected components
+from scipy.ndimage import label as cc_label
+from scipy.ndimage import find_objects as cc_find_objects
+
+
+# -------------------------
+# Logging
+# -------------------------
+def setup_logger(save_dir: str) -> logging.Logger:
+    os.makedirs(save_dir, exist_ok=True)
+    logger = logging.getLogger("yolo_obj_unet")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    fh = logging.FileHandler(os.path.join(save_dir, "run.log"), mode="w")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
+
+
+def cuda_mem_mb() -> float:
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / (1024 ** 2)
+    return 0.0
+
+
+# -------------------------
+# RLE encode (Airbus)
+#  - 1-indexed
+#  - column-major (Fortran) flatten
+# -------------------------
+def mask_to_rle(mask: np.ndarray) -> str:
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    if mask.max() == 0:
+        return ""
+
+    pixels = mask.reshape(-1, order="F")
+    pixels = np.concatenate([[0], pixels, [0]])
+    changes = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs = changes.copy()
+    runs[1::2] = runs[1::2] - runs[::2]
+    return " ".join(str(x) for x in runs)
+
+
+# -------------------------
+# Light U-Net (GroupNorm + SiLU)
+# -------------------------
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, gn_groups: int = 8):
+        super().__init__()
+        g = min(gn_groups, out_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
+        self.gn1   = nn.GroupNorm(g, out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.gn2   = nn.GroupNorm(g, out_ch)
+
+    def forward(self, x):
+        x = F.silu(self.gn1(self.conv1(x)))
+        x = F.silu(self.gn2(self.conv2(x)))
+        return x
+
+
+class UNetLite(nn.Module):
+    def __init__(self, in_ch: int = 4, base_ch: int = 24):
+        super().__init__()
+        self.e1 = ConvBlock(in_ch, base_ch)
+        self.p1 = nn.MaxPool2d(2)
+        self.e2 = ConvBlock(base_ch, base_ch * 2)
+        self.p2 = nn.MaxPool2d(2)
+        self.e3 = ConvBlock(base_ch * 2, base_ch * 4)
+        self.p3 = nn.MaxPool2d(2)
+        self.e4 = ConvBlock(base_ch * 4, base_ch * 8)
+        self.p4 = nn.MaxPool2d(2)
+
+        self.b  = ConvBlock(base_ch * 8, base_ch * 16)
+
+        self.u4 = nn.ConvTranspose2d(base_ch * 16, base_ch * 8, 2, stride=2)
+        self.d4 = ConvBlock(base_ch * 16, base_ch * 8)
+        self.u3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, 2, stride=2)
+        self.d3 = ConvBlock(base_ch * 8, base_ch * 4)
+        self.u2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 2, stride=2)
+        self.d2 = ConvBlock(base_ch * 4, base_ch * 2)
+        self.u1 = nn.ConvTranspose2d(base_ch * 2, base_ch, 2, stride=2)
+        self.d1 = ConvBlock(base_ch * 2, base_ch)
+
+        self.out = nn.Conv2d(base_ch, 1, 1)
+
+    def forward(self, x):
+        e1 = self.e1(x)
+        e2 = self.e2(self.p1(e1))
+        e3 = self.e3(self.p2(e2))
+        e4 = self.e4(self.p3(e3))
+        b  = self.b(self.p4(e4))
+
+        x = self.u4(b)
+        x = self.d4(torch.cat([x, e4], dim=1))
+        x = self.u3(x)
+        x = self.d3(torch.cat([x, e3], dim=1))
+        x = self.u2(x)
+        x = self.d2(torch.cat([x, e2], dim=1))
+        x = self.u1(x)
+        x = self.d1(torch.cat([x, e1], dim=1))
+        return self.out(x)
+
+
+# -------------------------
+# Loss: BCE + Dice
+# -------------------------
+def dice_loss_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    probs = probs.view(probs.size(0), -1)
+    targets = targets.view(targets.size(0), -1)
+    inter = (probs * targets).sum(dim=1)
+    union = probs.sum(dim=1) + targets.sum(dim=1)
+    dice = (2.0 * inter + eps) / (union + eps)
+    return 1.0 - dice.mean()
+
+def bce_dice_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    bce = F.binary_cross_entropy_with_logits(logits, targets)
+    dice = dice_loss_from_logits(logits, targets)
+    return bce + dice
+
+
+# -------------------------
+# Image utilities
+# -------------------------
+def pil_load_rgb(path: str) -> Image.Image:
+    return Image.open(path).convert("RGB")
+
+def pil_load_mask(path: str) -> Image.Image:
+    return Image.open(path).convert("L")
+
+def resize_pil(im: Image.Image, size: int, is_mask: bool = False) -> Image.Image:
+    if is_mask:
+        return im.resize((size, size), resample=Image.NEAREST)
+    return im.resize((size, size), resample=Image.BILINEAR)
+
+def to_tensor_image(im: Image.Image) -> torch.Tensor:
+    arr = np.asarray(im, dtype=np.float32) / 255.0
+    arr = np.transpose(arr, (2, 0, 1))
+    return torch.from_numpy(arr)
+
+def to_tensor_mask(im: Image.Image) -> torch.Tensor:
+    arr = np.asarray(im, dtype=np.uint8)
+    arr = (arr > 127).astype(np.float32)
+    return torch.from_numpy(arr[None, ...])
+
+def load_obj_cache_png(path: str) -> torch.Tensor:
+    im = Image.open(path).convert("L")
+    arr = np.asarray(im, dtype=np.float32) / 255.0
+    return torch.from_numpy(arr[None, ...])
+
+
+# -------------------------
+# Dataset
+#  - model input is resized to img_size
+#  - also returns original size for correct submission RLE
+# -------------------------
+class ShipObjUnetDataset(Dataset):
+    def __init__(self,
+                 images: List[str],
+                 masks: Optional[List[str]],
+                 obj_cache_dir: str,
+                 img_size: int = 512,
+                 train: bool = False,
+                 hflip_p: float = 0.5):
+        self.images = images
+        self.masks = masks
+        self.obj_cache_dir = obj_cache_dir
+        self.img_size = img_size
+        self.train = train
+        self.hflip_p = hflip_p
+        self.has_mask = masks is not None
+
+    def __len__(self):
+        return len(self.images)
+
+    def _obj_cache_path(self, img_path: str) -> str:
+        base = os.path.basename(img_path)
+        stem = os.path.splitext(base)[0]
+        return os.path.join(self.obj_cache_dir, stem + ".png")
+
+    def __getitem__(self, idx: int):
+        img_path = self.images[idx]
+        base_name = os.path.basename(img_path)
+
+        # original size (for submission)
+        with Image.open(img_path) as im0:
+            w0, h0 = im0.size
+
+        # resized for model
+        img = pil_load_rgb(img_path)
+        img = resize_pil(img, self.img_size, is_mask=False)
+        x_img = to_tensor_image(img)  # (3,H,W)
+
+        obj_path = self._obj_cache_path(img_path)
+        if not os.path.exists(obj_path):
+            raise FileNotFoundError(f"Objectness cache not found: {obj_path}")
+        x_obj = load_obj_cache_png(obj_path)  # (1,H,W)
+
+        do_flip = False
+        if self.train and (np.random.rand() < self.hflip_p):
+            do_flip = True
+            x_img = torch.flip(x_img, dims=[2])  # flip W
+            x_obj = torch.flip(x_obj, dims=[2])
+
+        if self.has_mask:
+            mask_path = self.masks[idx]
+            m = pil_load_mask(mask_path)
+            m = resize_pil(m, self.img_size, is_mask=True)
+            y = to_tensor_mask(m)
+            if do_flip:
+                y = torch.flip(y, dims=[2])
+        else:
+            y = torch.zeros((1, self.img_size, self.img_size), dtype=torch.float32)
+
+        x = torch.cat([x_img, x_obj], dim=0)  # (4,H,W)
+        return x, y, base_name, (h0, w0)
+
+
+# -------------------------
+# Instance extraction by CC
+# -------------------------
+@dataclass
+class Instance:
+    slc: Tuple[slice, slice]
+    mask: np.ndarray  # bool crop
+
+def instances_from_binary_mask(binmask: np.ndarray, min_area: int = 0) -> List[Instance]:
+    if binmask.dtype != np.uint8:
+        binmask = binmask.astype(np.uint8)
+    if binmask.max() == 0:
+        return []
+
+    lab, n = cc_label(binmask)
+    if n == 0:
+        return []
+
+    objs = cc_find_objects(lab)
+    insts: List[Instance] = []
+    for k, slc in enumerate(objs, start=1):
+        if slc is None:
+            continue
+        crop = (lab[slc] == k)
+        area = int(crop.sum())
+        if area == 0:
+            continue
+        if min_area > 0 and area < min_area:
+            continue
+        insts.append(Instance(slc=slc, mask=crop))
+    return insts
+
+
+# -------------------------
+# KaggleMeanF2 (approx, greedy matching)
+# -------------------------
+def iou_instances(a: Instance, b: Instance) -> float:
+    ay, ax = a.slc
+    by, bx = b.slc
+    y1 = max(ay.start, by.start)
+    y2 = min(ay.stop,  by.stop)
+    x1 = max(ax.start, bx.start)
+    x2 = min(ax.stop,  bx.stop)
+    if y2 <= y1 or x2 <= x1:
+        return 0.0
+
+    a_y1 = y1 - ay.start; a_y2 = y2 - ay.start
+    a_x1 = x1 - ax.start; a_x2 = x2 - ax.start
+    b_y1 = y1 - by.start; b_y2 = y2 - by.start
+    b_x1 = x1 - bx.start; b_x2 = x2 - bx.start
+
+    inter = np.logical_and(
+        a.mask[a_y1:a_y2, a_x1:a_x2],
+        b.mask[b_y1:b_y2, b_x1:b_x2]
+    ).sum()
+    if inter == 0:
+        return 0.0
+    union = a.mask.sum() + b.mask.sum() - inter
+    return float(inter) / float(union + 1e-9)
+
+def match_tp_fp_fn(pred_insts: List[Instance], gt_insts: List[Instance], thr: float) -> Tuple[int, int, int]:
+    if len(pred_insts) == 0 and len(gt_insts) == 0:
+        return 0, 0, 0
+    if len(pred_insts) == 0:
+        return 0, 0, len(gt_insts)
+    if len(gt_insts) == 0:
+        return 0, len(pred_insts), 0
+
+    pairs = []
+    for i, p in enumerate(pred_insts):
+        for j, g in enumerate(gt_insts):
+            iou = iou_instances(p, g)
+            if iou >= thr:
+                pairs.append((iou, i, j))
+    pairs.sort(reverse=True, key=lambda x: x[0])
+
+    matched_p = set()
+    matched_g = set()
+    tp = 0
+    for _, i, j in pairs:
+        if i in matched_p or j in matched_g:
+            continue
+        matched_p.add(i)
+        matched_g.add(j)
+        tp += 1
+
+    fp = len(pred_insts) - tp
+    fn = len(gt_insts) - tp
+    return tp, fp, fn
+
+def fbeta(tp: int, fp: int, fn: int, beta: float = 2.0) -> float:
+    beta2 = beta * beta
+    prec = tp / (tp + fp + 1e-9)
+    rec  = tp / (tp + fn + 1e-9)
+    return (1 + beta2) * prec * rec / (beta2 * prec + rec + 1e-9)
+
+def kaggle_mean_f2_from_masks(pred_bin: np.ndarray, gt_bin: np.ndarray, min_area: int = 0) -> float:
+    pred_insts = instances_from_binary_mask(pred_bin, min_area=min_area)
+    gt_insts   = instances_from_binary_mask(gt_bin,   min_area=0)
+    thrs = [0.50 + 0.05 * k for k in range(10)]
+    f2s = []
+    for t in thrs:
+        tp, fp, fn = match_tp_fp_fn(pred_insts, gt_insts, t)
+        f2s.append(fbeta(tp, fp, fn, beta=2.0))
+    return float(np.mean(f2s))
+
+
+# -------------------------
+# YOLO objectness cache
+# -------------------------
+def build_objectness_cache_ultralytics(
+    img_paths: List[str],
+    cache_dir: str,
+    img_size: int,
+    yolo_weights: str,
+    device: str,
+    conf_thres: float,
+    yolo_batch: int,
+    logger: logging.Logger
+):
+    os.makedirs(cache_dir, exist_ok=True)
+
+    try:
+        from ultralytics import YOLO
+    except Exception as e:
+        raise RuntimeError("ultralytics が import できません。`pip install -U ultralytics` を実行してください。") from e
+
+    logger.info(f"[YOLO] Loading weights: {yolo_weights}")
+    model = YOLO(yolo_weights)
+
+    # which files are missing
+    todo = []
+    for p in img_paths:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        outp = os.path.join(cache_dir, stem + ".png")
+        if not os.path.exists(outp):
+            todo.append(p)
+
+    logger.info(f"[YOLO] Cache: total={len(img_paths)} todo={len(todo)} imgsz={img_size} conf={conf_thres} batch={yolo_batch}")
+    if len(todo) == 0:
+        return
+
+    use_cuda = device.startswith("cuda") and torch.cuda.is_available()
+    t0 = time.time()
+
+    # conservative: small batches to avoid VRAM spikes
+    bs = max(1, int(yolo_batch))
+    for i in range(0, len(todo), bs):
+        batch = todo[i:i+bs]
+
+        ims = []
+        stems = []
+        for p in batch:
+            im = pil_load_rgb(p)
+            im = resize_pil(im, img_size, is_mask=False)
+            ims.append(np.asarray(im))  # uint8 RGB
+            stems.append(os.path.splitext(os.path.basename(p))[0])
+
+        # YOLO predict
+        # note: ultralytics handles preprocessing; half=True reduces VRAM on cuda
+        results = model.predict(
+            source=ims,
+            imgsz=img_size,
+            conf=conf_thres,
+            iou=0.7,
+            device=device,
+            half=use_cuda,
+            verbose=False
+        )
+
+        for r, stem in zip(results, stems):
+            hm = np.zeros((img_size, img_size), dtype=np.float32)
+
+            if r.boxes is not None and len(r.boxes) > 0:
+                xyxy = r.boxes.xyxy.detach().cpu().numpy()
+                confs = r.boxes.conf.detach().cpu().numpy()
+
+                for (x1, y1, x2, y2), c in zip(xyxy, confs):
+                    x1 = int(np.clip(np.floor(x1), 0, img_size-1))
+                    y1 = int(np.clip(np.floor(y1), 0, img_size-1))
+                    x2 = int(np.clip(np.ceil(x2),  0, img_size))
+                    y2 = int(np.clip(np.ceil(y2),  0, img_size))
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    hm[y1:y2, x1:x2] = np.maximum(hm[y1:y2, x1:x2], float(c))
+
+            outp = os.path.join(cache_dir, stem + ".png")
+            hm_u8 = (np.clip(hm, 0.0, 1.0) * 255.0).astype(np.uint8)
+            Image.fromarray(hm_u8, mode="L").save(outp)
+
+        if (i // bs) % 25 == 0:
+            logger.info(f"[YOLO] progress {i}/{len(todo)}")
+
+    logger.info(f"[YOLO] Cache built in {time.time()-t0:.1f}s")
+
+
+# -------------------------
+# Sanity check of objectness validity
+# -------------------------
+def sanity_check_objectness(
+    val_imgs: List[str],
+    val_msks: List[str],
+    obj_cache_dir: str,
+    img_size: int,
+    out_dir: str,
+    sample_n: int,
+    obj_thr: float,
+    logger: logging.Logger
+):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # align by stem
+    def stem(p: str) -> str:
+        return os.path.splitext(os.path.basename(p))[0]
+    m_map = {stem(p): p for p in val_msks}
+    pairs = [(p, m_map.get(stem(p), None)) for p in val_imgs]
+    pairs = [pm for pm in pairs if pm[1] is not None]
+
+    if len(pairs) == 0:
+        logger.info("[SANITY] no val pairs for sanity check")
+        return
+
+    rng = np.random.RandomState(42)
+    rng.shuffle(pairs)
+    pairs = pairs[:min(sample_n, len(pairs))]
+
+    hit_rates = []
+    fa_rates  = []
+    mean_objs = []
+
+    # save a few visualizations
+    vis_k = min(20, len(pairs))
+    vis_pairs = pairs[:vis_k]
+    vis_dir = os.path.join(out_dir, "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    for idx, (ip, mp) in enumerate(pairs):
+        s = stem(ip)
+        op = os.path.join(obj_cache_dir, s + ".png")
+        if not os.path.exists(op):
+            continue
+
+        # load resized GT mask
+        m = pil_load_mask(mp)
+        m = resize_pil(m, img_size, is_mask=True)
+        gt = (np.asarray(m, dtype=np.uint8) > 127).astype(np.uint8)
+
+        # load obj
+        o = Image.open(op).convert("L")
+        obj = np.asarray(o, dtype=np.float32) / 255.0
+
+        mean_objs.append(float(obj.mean()))
+
+        obj_bin = (obj >= obj_thr).astype(np.uint8)
+        gt_pos = gt.sum()
+        gt_neg = gt.size - gt_pos
+
+        if gt_pos > 0:
+            hit = (obj_bin[gt == 1].sum() / (gt_pos + 1e-9))
+        else:
+            hit = 0.0
+        if gt_neg > 0:
+            fa = (obj_bin[gt == 0].sum() / (gt_neg + 1e-9))
+        else:
+            fa = 0.0
+
+        hit_rates.append(float(hit))
+        fa_rates.append(float(fa))
+
+        # visualization
+        if idx < vis_k:
+            img = pil_load_rgb(ip)
+            img = resize_pil(img, img_size, is_mask=False)
+
+            # make overlay: red where gt=1, green where obj_bin=1
+            rgb = np.asarray(img).copy()
+            overlay = rgb.copy()
+            # green for obj
+            overlay[obj_bin == 1, 1] = 255
+            # red for gt
+            overlay[gt == 1, 0] = 255
+            # blend
+            out = (0.6 * rgb + 0.4 * overlay).astype(np.uint8)
+
+            # compose side-by-side
+            obj_u8 = (np.clip(obj, 0, 1) * 255).astype(np.uint8)
+            gt_u8  = (gt * 255).astype(np.uint8)
+
+            panel1 = Image.fromarray(rgb, mode="RGB")
+            panel2 = Image.fromarray(np.stack([obj_u8]*3, axis=-1), mode="RGB")
+            panel3 = Image.fromarray(np.stack([gt_u8]*3, axis=-1), mode="RGB")
+            panel4 = Image.fromarray(out, mode="RGB")
+
+            canvas = Image.new("RGB", (img_size*4, img_size))
+            canvas.paste(panel1, (0, 0))
+            canvas.paste(panel2, (img_size, 0))
+            canvas.paste(panel3, (img_size*2, 0))
+            canvas.paste(panel4, (img_size*3, 0))
+
+            draw = ImageDraw.Draw(canvas)
+            draw.text((10, 10), f"{os.path.basename(ip)}", fill=(255, 255, 255))
+            draw.text((img_size+10, 10), f"obj(thr={obj_thr})", fill=(255, 255, 255))
+            draw.text((img_size*2+10, 10), "GT", fill=(255, 255, 255))
+            draw.text((img_size*3+10, 10), f"overlay hit={hit:.2f} fa={fa:.2f}", fill=(255, 255, 255))
+
+            canvas.save(os.path.join(vis_dir, f"{s}.png"))
+
+    stats = {
+        "sample_n": int(len(hit_rates)),
+        "obj_thr": float(obj_thr),
+        "hit_rate_mean": float(np.mean(hit_rates)) if hit_rates else 0.0,
+        "hit_rate_p50":  float(np.median(hit_rates)) if hit_rates else 0.0,
+        "fa_rate_mean":  float(np.mean(fa_rates)) if fa_rates else 0.0,
+        "fa_rate_p50":   float(np.median(fa_rates)) if fa_rates else 0.0,
+        "obj_mean_mean": float(np.mean(mean_objs)) if mean_objs else 0.0,
+        "obj_mean_p50":  float(np.median(mean_objs)) if mean_objs else 0.0,
+    }
+
+    with open(os.path.join(out_dir, "objectness_sanity.json"), "w") as f:
+        json.dump(stats, f, indent=2)
+
+    logger.info(f"[SANITY] objectness stats saved: {os.path.join(out_dir, 'objectness_sanity.json')}")
+    logger.info(f"[SANITY] hit(mean)={stats['hit_rate_mean']:.3f} fa(mean)={stats['fa_rate_mean']:.3f} objmean={stats['obj_mean_mean']:.3f}")
+    logger.info(f"[SANITY] visuals saved under: {vis_dir}")
+
+
+# -------------------------
+# Evaluate (val) and tune threshold
+# -------------------------
+@torch.no_grad()
+def evaluate_and_tune_threshold(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+    beta_gate: float,
+    thresholds: List[float],
+    tune_max_images: int,
+    min_area: int,
+    logger: logging.Logger
+) -> Dict:
+    model.eval()
+    losses = []
+    cache_probs = []
+    cache_gts = []
+    n_seen = 0
+
+    for x, y, _, _ in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        logits = model(x)
+        obj = x[:, 3:4, :, :]  # (B,1,H,W) in [0,1]
+
+        # soft gate on logits: add bias from obj
+        logits_g = logits + beta_gate * (obj * 2.0 - 1.0)
+
+        loss = bce_dice_loss(logits_g, y)
+        losses.append(float(loss.item()))
+
+        probs = torch.sigmoid(logits_g).detach().cpu().numpy()[:, 0]
+        gts   = y.detach().cpu().numpy()[:, 0]
+
+        for p, g in zip(probs, gts):
+            cache_probs.append(p)
+            cache_gts.append(g)
+            n_seen += 1
+            if tune_max_images > 0 and n_seen >= tune_max_images:
+                break
+        if tune_max_images > 0 and n_seen >= tune_max_images:
+            break
+
+    # threshold tuning by KaggleMeanF2 approximation
+    best_thr = 0.5
+    best_f2 = -1.0
+    for thr in thresholds:
+        f2_list = []
+        for p, g in zip(cache_probs, cache_gts):
+            pred_bin = (p >= thr).astype(np.uint8)
+            gt_bin   = (g >= 0.5).astype(np.uint8)
+            f2_list.append(kaggle_mean_f2_from_masks(pred_bin, gt_bin, min_area=min_area))
+        mean_f2 = float(np.mean(f2_list)) if f2_list else 0.0
+        if mean_f2 > best_f2:
+            best_f2 = mean_f2
+            best_thr = float(thr)
+
+    # pixel metrics at best_thr
+    ious = []
+    ps = []
+    rs = []
+    for p, g in zip(cache_probs, cache_gts):
+        pb = (p >= best_thr).astype(np.uint8)
+        gb = (g >= 0.5).astype(np.uint8)
+        inter = (pb & gb).sum()
+        union = (pb | gb).sum()
+        iou = inter / (union + 1e-9)
+        tp = inter
+        fp = (pb & (1 - gb)).sum()
+        fn = ((1 - pb) & gb).sum()
+        prec = tp / (tp + fp + 1e-9)
+        rec  = tp / (tp + fn + 1e-9)
+        ious.append(float(iou)); ps.append(float(prec)); rs.append(float(rec))
+
+    return {
+        "val_loss": float(np.mean(losses)) if losses else 0.0,
+        "best_thr": best_thr,
+        "best_kaggle_mean_f2": best_f2,
+        "pixel_iou": float(np.mean(ious)) if ious else 0.0,
+        "pixel_precision": float(np.mean(ps)) if ps else 0.0,
+        "pixel_recall": float(np.mean(rs)) if rs else 0.0,
+        "tuned_images": int(len(cache_probs)),
+    }
+
+
+# -------------------------
+# Main train / infer
+# -------------------------
+def train_and_submit(args):
+    os.makedirs(args.save_dir, exist_ok=True)
+    logger = setup_logger(args.save_dir)
+
+    logger.info("=== CONFIG ===")
+    for k, v in vars(args).items():
+        logger.info(f"{k} = {v}")
+
+    # device
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
+    logger.info(f"DEVICE = {device}")
+
+    # seed
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.benchmark = True
+
+    # collect files
+    def list_sorted(pattern: str) -> List[str]:
+        xs = glob.glob(pattern)
+        xs.sort()
+        return xs
+
+    split_dir = args.split_dir
+    train_imgs = list_sorted(os.path.join(split_dir, "train", "images", "*"))
+    train_msks = list_sorted(os.path.join(split_dir, "train", "masks", "*"))
+    val_imgs   = list_sorted(os.path.join(split_dir, "val",   "images", "*"))
+    val_msks   = list_sorted(os.path.join(split_dir, "val",   "masks", "*"))
+    test_imgs  = list_sorted(os.path.join(split_dir, "test",  "images", "*"))
+
+    if len(train_imgs) == 0 or len(val_imgs) == 0:
+        raise FileNotFoundError(
+            f"split_dir 構造が想定と違います: {split_dir}\n"
+            f"期待: train/images, train/masks, val/images, val/masks, test/images"
+        )
+
+    # align masks by stem
+    def stem(p: str) -> str:
+        return os.path.splitext(os.path.basename(p))[0]
+
+    train_m_map = {stem(p): p for p in train_msks}
+    val_m_map   = {stem(p): p for p in val_msks}
+
+    train_pairs = [(p, train_m_map.get(stem(p), None)) for p in train_imgs]
+    val_pairs   = [(p, val_m_map.get(stem(p), None)) for p in val_imgs]
+    train_pairs = [pm for pm in train_pairs if pm[1] is not None]
+    val_pairs   = [pm for pm in val_pairs if pm[1] is not None]
+
+    train_imgs = [p for p, _ in train_pairs]
+    train_msks = [m for _, m in train_pairs]
+    val_imgs   = [p for p, _ in val_pairs]
+    val_msks   = [m for _, m in val_pairs]
+
+    logger.info(f"TRAIN={len(train_imgs)} VAL={len(val_imgs)} TEST={len(test_imgs)}")
+
+    # objectness cache dir
+    ystem = os.path.splitext(os.path.basename(args.yolo_weights))[0]
+    obj_cache_dir = os.path.join(split_dir, f"obj_cache__{ystem}__{args.img_size}")
+    logger.info(f"OBJ_CACHE_DIR = {obj_cache_dir}")
+
+    # build cache for all images
+    all_for_cache = list(dict.fromkeys(train_imgs + val_imgs + test_imgs))
+    build_objectness_cache_ultralytics(
+        img_paths=all_for_cache,
+        cache_dir=obj_cache_dir,
+        img_size=args.img_size,
+        yolo_weights=args.yolo_weights,
+        device=device,
+        conf_thres=args.yolo_conf,
+        yolo_batch=args.yolo_batch,
+        logger=logger
+    )
+
+    # sanity check objectness validity (numbers + visualization)
+    sanity_dir = os.path.join(args.save_dir, "sanity_objectness")
+    sanity_check_objectness(
+        val_imgs=val_imgs,
+        val_msks=val_msks,
+        obj_cache_dir=obj_cache_dir,
+        img_size=args.img_size,
+        out_dir=sanity_dir,
+        sample_n=args.sanity_samples,
+        obj_thr=args.sanity_obj_thr,
+        logger=logger
+    )
+
+    # datasets
+    ds_tr = ShipObjUnetDataset(
+        images=train_imgs, masks=train_msks,
+        obj_cache_dir=obj_cache_dir, img_size=args.img_size,
+        train=True, hflip_p=args.hflip
+    )
+    ds_va = ShipObjUnetDataset(
+        images=val_imgs, masks=val_msks,
+        obj_cache_dir=obj_cache_dir, img_size=args.img_size,
+        train=False
+    )
+
+    dl_tr = DataLoader(
+        ds_tr, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True,
+        drop_last=True
+    )
+    dl_va = DataLoader(
+        ds_va, batch_size=args.eval_batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
+        drop_last=False
+    )
+
+    # model
+    model = UNetLite(in_ch=4, base_ch=args.unet_base).to(device)
+    logger.info(f"MODEL = UNetLite(in_ch=4, base_ch={args.unet_base})")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.startswith("cuda"))
+
+    thresholds = [round(x, 2) for x in np.linspace(0.05, 0.95, 19)]
+
+    best = {"epoch": -1, "best_kaggle_mean_f2": -1.0, "best_thr": 0.5}
+
+    logger.info("=== TRAIN START ===")
+    for ep in range(1, args.epochs + 1):
+        torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
+        model.train()
+        t0 = time.time()
+        tr_losses = []
+
+        for x, y, _, _ in dl_tr:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            opt.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=args.amp and device.startswith("cuda")):
+                logits = model(x)
+                obj = x[:, 3:4, :, :]
+                logits_g = logits + args.beta_gate * (obj * 2.0 - 1.0)
+                loss = bce_dice_loss(logits_g, y)
+
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+            tr_losses.append(float(loss.item()))
+
+        ev = evaluate_and_tune_threshold(
+            model=model, loader=dl_va, device=device,
+            beta_gate=args.beta_gate,
+            thresholds=thresholds,
+            tune_max_images=args.tune_max_images,
+            min_area=args.min_area,
+            logger=logger
+        )
+
+        dt = time.time() - t0
+        peak_mb = cuda_mem_mb()
+        logger.info(
+            f"[Epoch {ep:02d}/{args.epochs}] time={dt:.1f}s "
+            f"train_loss={np.mean(tr_losses):.4f} val_loss={ev['val_loss']:.4f} "
+            f"VAL KaggleMeanF2={ev['best_kaggle_mean_f2']:.4f} thr={ev['best_thr']:.2f} | "
+            f"pixel(IoU={ev['pixel_iou']:.4f}, P={ev['pixel_precision']:.4f}, R={ev['pixel_recall']:.4f}) "
+            f"tuned_n={ev['tuned_images']} peakMB={peak_mb:.1f}"
+        )
+
+        if ev["best_kaggle_mean_f2"] > best["best_kaggle_mean_f2"]:
+            best = {
+                "epoch": ep,
+                "best_kaggle_mean_f2": float(ev["best_kaggle_mean_f2"]),
+                "best_thr": float(ev["best_thr"]),
+            }
+            ckpt_path = os.path.join(args.save_dir, "best_model.pth")
+            torch.save({"model": model.state_dict(), "args": vars(args), "best": best}, ckpt_path)
+            with open(os.path.join(args.save_dir, "thr_best.json"), "w") as f:
+                json.dump(best, f, indent=2)
+            logger.info(f"[BEST] saved {ckpt_path} | thr={best['best_thr']:.2f} f2={best['best_kaggle_mean_f2']:.4f}")
+
+    logger.info(f"=== TRAIN DONE === best={best}")
+
+    # -------------------------
+    # INFER -> submission.csv
+    # -------------------------
+    ckpt_path = os.path.join(args.save_dir, "best_model.pth")
+    if os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(ckpt["model"])
+        best_thr = float(ckpt["best"]["best_thr"])
+    else:
+        best_thr = float(best["best_thr"])
+
+    model.to(device)
+    model.eval()
+
+    ds_te = ShipObjUnetDataset(
+        images=test_imgs, masks=None,
+        obj_cache_dir=obj_cache_dir, img_size=args.img_size,
+        train=False
+    )
+    dl_te = DataLoader(
+        ds_te, batch_size=args.eval_batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
+        drop_last=False
+    )
+
+    sub_path = os.path.join(args.save_dir, "submission.csv")
+    logger.info(f"=== INFER TEST -> {sub_path} (thr={best_thr:.2f}) ===")
+
+    rows = []
+    with torch.no_grad():
+        for x, _, names, orig_hws in dl_te:
+            x = x.to(device, non_blocking=True)
+
+            with torch.cuda.amp.autocast(enabled=args.amp and device.startswith("cuda")):
+                logits = model(x)
+                obj = x[:, 3:4, :, :]
+                logits_g = logits + args.beta_gate * (obj * 2.0 - 1.0)
+                probs = torch.sigmoid(logits_g)  # (B,1,sz,sz)
+
+            probs_np = probs.detach().cpu().numpy()  # (B,1,sz,sz)
+
+            for b in range(probs_np.shape[0]):
+                nm = names[b]
+                h0, w0 = orig_hws[b]
+
+                p = probs_np[b, 0]  # (sz,sz) in [0,1]
+
+                # upsample to original resolution for correct RLE
+                p_t = torch.from_numpy(p[None, None, ...])  # (1,1,sz,sz)
+                p_up = F.interpolate(p_t, size=(int(h0), int(w0)), mode="bilinear", align_corners=False)
+                p_up = p_up[0, 0].numpy()
+
+                binm = (p_up >= best_thr).astype(np.uint8)
+                insts = instances_from_binary_mask(binm, min_area=args.min_area)
+
+                if len(insts) == 0:
+                    rows.append((nm, ""))  # no ship
+                else:
+                    H, W = binm.shape
+                    for inst in insts:
+                        imask = np.zeros((H, W), dtype=np.uint8)
+                        imask[inst.slc] = inst.mask.astype(np.uint8)
+                        rle = mask_to_rle(imask)
+                        if rle.strip() == "":
+                            continue
+                        rows.append((nm, rle))
+
+    # write CSV
+    with open(sub_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ImageId", "EncodedPixels"])
+        for imgid, rle in rows:
+            w.writerow([imgid, rle])
+
+    logger.info(f"[DONE] submission rows={len(rows)} | thr={best_thr:.2f}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser("YOLO objectness -> U-Net (quarter) train/eval/submit")
+
+    # paths
+    p.add_argument("--split-dir", type=str,
+                   default="/home/ougaishibashi/kaggle_competition/airbus-ship-detection/prepared_splits/airbus_dataset_quarter")
+    p.add_argument("--save-dir", type=str,
+                   default="/home/ougaishibashi/kaggle_competition/airbus-ship-detection/runs/yolo_obj_unet_quarter")
+
+    # runtime
+    p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--num-workers", type=int, default=2)
+
+    # training (指定条件)
+    p.add_argument("--epochs", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--eval-batch-size", type=int, default=8)
+    p.add_argument("--img-size", type=int, default=512)
+    p.add_argument("--amp", action="store_true", default=True)
+
+    # YOLO
+    p.add_argument("--yolo-weights", type=str, default="yolov8n.pt")
+    p.add_argument("--yolo-conf", type=float, default=0.10)
+    p.add_argument("--yolo-batch", type=int, default=8)
+
+    # U-Net
+    p.add_argument("--unet-base", type=int, default=24)  # safety default for T4+batch8
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+
+    # gating
+    p.add_argument("--beta-gate", type=float, default=1.0)
+
+    # augmentation
+    p.add_argument("--hflip", type=float, default=0.5)
+
+    # threshold tuning
+    p.add_argument("--tune-max-images", type=int, default=2000)
+
+    # postprocess
+    p.add_argument("--min-area", type=int, default=30)  # small FP removal (common heuristic)
+
+    # sanity check settings
+    p.add_argument("--sanity-samples", type=int, default=300)
+    p.add_argument("--sanity-obj-thr", type=float, default=0.30)
+
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    train_and_submit(args)
