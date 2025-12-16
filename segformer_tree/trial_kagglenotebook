@@ -1,0 +1,852 @@
+# =========================
+# ONE-CELL Kaggle Runner (NO protobuf / NO transformers) - FIXED timm backbone
+# SegFormer-like (MiT backbone via timm if available) -> instance proposals -> Tree filter
+# env fix -> path detect -> safe template submission -> train (early stop) -> auto-thr -> train tree -> infer -> template-aligned submission
+# =========================
+
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["TRANSFORMERS_NO_FLAX"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import glob
+import random
+import time
+import json
+import logging
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms.functional as TF
+
+# --- SciPy for connected components (CPU) ---
+from scipy.ndimage import label as cc_label
+from scipy.ndimage import find_objects
+
+# --- sklearn for tree model ---
+from sklearn.ensemble import HistGradientBoostingClassifier
+
+# -------------------------
+# CONFIG
+# -------------------------
+SEED = 42
+
+# IMG size for training/inference
+IMG_SIZE = 384
+
+# Data sizes
+MAX_TRAIN_IMAGES = 20000
+MAX_VAL_IMAGES   = 1500
+
+# Sampling
+PREFER_POSITIVE = True
+POS_RATIO = 0.6
+
+# Train
+MAX_EPOCH_CAP = 30
+BATCH_SIZE = 4
+LR = 5e-5
+WEIGHT_DECAY = 0.01
+
+# Early stopping on val pixel-Fbeta (beta^2 = 1.5; recall-lean but not extreme)
+BETA2 = 1.5
+EARLY_PATIENCE = 2
+EARLY_MIN_DELTA = 1e-4
+
+# Threshold auto (histogram)
+THR_BINS = 200  # bin width = 0.005
+
+# Stage2: proposal + tree
+PROP_MULT = 0.80  # proposal threshold = best_thr * PROP_MULT
+TREE_BETA2 = 1.5
+TREE_PROB_THR_GRID = np.linspace(0.05, 0.95, 91)
+
+# Paths
+SUB_PATH  = "/kaggle/working/submission.csv"
+LOG_PATH  = "/kaggle/working/run_all_onecell.log"
+CKPT_PATH = "/kaggle/working/segformer_like_best.pth"
+META_PATH = "/kaggle/working/segformer_like_best_meta.json"
+TREE_PATH = "/kaggle/working/tree_model.pkl"
+TREE_META = "/kaggle/working/tree_meta.json"
+
+# -------------------------
+# LOGGER
+# -------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_PATH)]
+)
+logger = logging.getLogger("onecell_noproto_fixed")
+
+# -------------------------
+# REPRO / DEVICE
+# -------------------------
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"DEVICE={DEVICE} torch={torch.__version__}")
+
+try:
+    if DEVICE.type == "cuda":
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+except Exception:
+    pass
+
+# -------------------------
+# PATH AUTO-DETECT (Airbus)
+# -------------------------
+def find_airbus_paths(root="/kaggle/input"):
+    if (not os.path.exists(root)) or (len(os.listdir(root)) == 0):
+        return None
+    hits = glob.glob(os.path.join(root, "**", "train_ship_segmentations_v2.csv"), recursive=True)
+    if not hits:
+        return None
+    train_csv = hits[0]
+    data_dir = os.path.dirname(train_csv)
+
+    sample_sub = os.path.join(data_dir, "sample_submission_v2.csv")
+    train_dir = os.path.join(data_dir, "train_v2")
+    test_dir  = os.path.join(data_dir, "test_v2")
+
+    if not os.path.exists(sample_sub):
+        ss = glob.glob(os.path.join(data_dir, "**", "sample_submission_v2.csv"), recursive=True)
+        if ss:
+            sample_sub = ss[0]
+    if not os.path.isdir(train_dir):
+        td = glob.glob(os.path.join(data_dir, "**", "train_v2"), recursive=True)
+        if td:
+            train_dir = td[0]
+    if not os.path.isdir(test_dir):
+        td = glob.glob(os.path.join(data_dir, "**", "test_v2"), recursive=True)
+        if td:
+            test_dir = td[0]
+
+    need = [train_csv, sample_sub, train_dir, test_dir]
+    if not all(os.path.exists(p) for p in need):
+        return None
+
+    return {
+        "DATA_DIR": data_dir,
+        "TRAIN_CSV": train_csv,
+        "SAMPLE_SUB_CSV": sample_sub,
+        "TRAIN_IMG_DIR": train_dir,
+        "TEST_IMG_DIR": test_dir
+    }
+
+paths = find_airbus_paths()
+if paths is None:
+    logger.warning("[WARN] Airbus data not found under /kaggle/input. listing=%s",
+                   (os.listdir("/kaggle/input") if os.path.exists("/kaggle/input") else "N/A"))
+    raise SystemExit("Airbus data not mounted. Please add competition dataset to the notebook (Kaggle 'Add data').")
+
+logger.info("=== DETECTED PATHS ===")
+for k, v in paths.items():
+    logger.info(f"{k}: {v}")
+
+TRAIN_CSV = paths["TRAIN_CSV"]
+SAMPLE_SUB_CSV = paths["SAMPLE_SUB_CSV"]
+TRAIN_IMG_DIR = paths["TRAIN_IMG_DIR"]
+TEST_IMG_DIR  = paths["TEST_IMG_DIR"]
+
+# -------------------------
+# RLE (Airbus Fortran order)
+# -------------------------
+def rle_decode(rle: str, shape: Tuple[int, int]) -> np.ndarray:
+    H, W = shape
+    if rle is None or rle == "" or (isinstance(rle, float) and np.isnan(rle)):
+        return np.zeros((H, W), dtype=np.uint8)
+    s = rle.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    img = np.zeros(H * W, dtype=np.uint8)
+    for st, en in zip(starts, ends):
+        img[st:en] = 1
+    return img.reshape((H, W), order="F")
+
+def rle_encode(mask: np.ndarray) -> str:
+    if mask is None:
+        return ""
+    m = mask.astype(np.uint8)
+    if m.max() == 0:
+        return ""
+    pixels = m.flatten(order="F")
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+# -------------------------
+# TEMPLATE: write empty submission first (safety)
+# -------------------------
+template = pd.read_csv(SAMPLE_SUB_CSV)
+if "ImageId" not in template.columns:
+    raise ValueError("sample_submission_v2.csv has no ImageId column.")
+if "EncodedPixels" not in template.columns:
+    template["EncodedPixels"] = ""
+template["EncodedPixels"] = ""
+template.to_csv(SUB_PATH, index=False)
+if (not os.path.exists(SUB_PATH)) or os.path.getsize(SUB_PATH) == 0:
+    raise RuntimeError("submission.csv was not created or is empty (0 bytes).")
+logger.info(f"[SAFE] template-aligned empty submission created: rows={len(template)} bytes={os.path.getsize(SUB_PATH)}")
+
+# -------------------------
+# BUILD TRAIN INDEX
+# -------------------------
+df = pd.read_csv(TRAIN_CSV)
+IMG2RLES: Dict[str, List[str]] = {}
+for img_id, g in df.groupby("ImageId"):
+    IMG2RLES[img_id] = g["EncodedPixels"].dropna().tolist()
+ALL_TRAIN_IDS = list(IMG2RLES.keys())
+
+def is_positive(img_id: str) -> bool:
+    return len(IMG2RLES.get(img_id, [])) > 0
+
+def train_val_split(ids, val_ratio=0.15, seed=42):
+    rng = np.random.RandomState(seed)
+    ids = ids.copy()
+    rng.shuffle(ids)
+    n_val = int(len(ids) * val_ratio)
+    return ids[n_val:], ids[:n_val]
+
+def subsample_ids(ids, max_n, prefer_positive, pos_ratio, seed):
+    if max_n is None or max_n <= 0 or max_n >= len(ids):
+        return ids
+    rng = np.random.RandomState(seed)
+    if not prefer_positive:
+        rng.shuffle(ids)
+        return ids[:max_n]
+    pos = [x for x in ids if is_positive(x)]
+    neg = [x for x in ids if not is_positive(x)]
+    rng.shuffle(pos); rng.shuffle(neg)
+    n_pos = int(max_n * pos_ratio)
+    n_neg = max_n - n_pos
+    out = pos[:min(n_pos, len(pos))] + neg[:min(n_neg, len(neg))]
+    remain = [x for x in ids if x not in set(out)]
+    rng.shuffle(remain)
+    need = max_n - len(out)
+    if need > 0:
+        out += remain[:need]
+    rng.shuffle(out)
+    return out
+
+train_ids, val_ids = train_val_split(ALL_TRAIN_IDS, val_ratio=0.15, seed=SEED)
+train_ids = subsample_ids(train_ids, MAX_TRAIN_IMAGES, PREFER_POSITIVE, POS_RATIO, SEED)
+val_ids   = subsample_ids(val_ids,   MAX_VAL_IMAGES,   False,          POS_RATIO, SEED)
+
+logger.info(f"train_ids={len(train_ids)} pos={sum(is_positive(x) for x in train_ids)}")
+logger.info(f"val_ids  ={len(val_ids)} pos={sum(is_positive(x) for x in val_ids)}")
+
+# -------------------------
+# DATASET / LOADER
+# -------------------------
+MEAN = (0.485, 0.456, 0.406)
+STD  = (0.229, 0.224, 0.225)
+
+class ShipSegDataset(Dataset):
+    def __init__(self, img_dir, ids, img2rles, img_size=384, training=True):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.img2rles = img2rles
+        self.img_size = img_size
+        self.training = training
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        img_id = self.ids[idx]
+        path = os.path.join(self.img_dir, img_id)
+        img = Image.open(path).convert("RGB")
+        W0, H0 = img.size
+
+        rles = self.img2rles.get(img_id, [])
+        mask = np.zeros((H0, W0), dtype=np.uint8)
+        for rle in rles:
+            mask |= rle_decode(rle, (H0, W0))
+
+        img_r = img.resize((self.img_size, self.img_size), resample=Image.BILINEAR)
+        mask_r = Image.fromarray(mask * 255).resize((self.img_size, self.img_size), resample=Image.NEAREST)
+        mask_r = (np.array(mask_r) > 127).astype(np.uint8)
+
+        if self.training:
+            if random.random() < 0.5:
+                img_r = TF.hflip(img_r); mask_r = np.fliplr(mask_r).copy()
+            if random.random() < 0.5:
+                img_r = TF.vflip(img_r); mask_r = np.flipud(mask_r).copy()
+
+        x = TF.to_tensor(img_r)
+        x = TF.normalize(x, MEAN, STD)
+        y = torch.from_numpy(mask_r).long()
+        return {"image_id": img_id, "pixel_values": x, "labels": y}
+
+def collate_fn(batch):
+    x = torch.stack([b["pixel_values"] for b in batch], dim=0)
+    y = torch.stack([b["labels"] for b in batch], dim=0)
+    ids = [b["image_id"] for b in batch]
+    return {"image_ids": ids, "pixel_values": x, "labels": y}
+
+train_ds = ShipSegDataset(TRAIN_IMG_DIR, train_ids, IMG2RLES, img_size=IMG_SIZE, training=True)
+val_ds   = ShipSegDataset(TRAIN_IMG_DIR, val_ids,   IMG2RLES, img_size=IMG_SIZE, training=False)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True, collate_fn=collate_fn)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate_fn)
+logger.info(f"steps/epoch: train={len(train_loader)} val={len(val_loader)}")
+
+# -------------------------
+# timm import + update (FIX)
+# -------------------------
+def _import_timm():
+    try:
+        import timm
+        return timm
+    except Exception:
+        import sys, subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "-q", "install", "timm"])
+        import timm
+        return timm
+
+# force upgrade timm (protobuf unrelated)
+import sys, subprocess
+subprocess.check_call([sys.executable, "-m", "pip", "-q", "install", "-U", "timm"])
+
+timm = _import_timm()
+logger.info(f"timm version={getattr(timm, '__version__', 'unknown')}")
+
+def build_backbone():
+    available = set(timm.list_models())
+
+    preferred = ["mit_b0","mit_b1","mit_b2","mit_b3","mit_b4","mit_b5"]
+    candidates = [m for m in preferred if m in available]
+
+    # fallback CNN backbones if MiT isn't available in this timm build
+    fallback = ["mobilenetv3_large_100", "efficientnet_b0", "resnet34", "resnet50"]
+    candidates += [m for m in fallback if m in available]
+
+    if len(candidates) == 0:
+        sample = sorted(list(available))[:40]
+        raise RuntimeError(f"timm has no expected backbones. Example models: {sample}")
+
+    last_err = None
+    for name in candidates:
+        for pretrained in [True, False]:
+            try:
+                m = timm.create_model(name, features_only=True, pretrained=pretrained)
+                logger.info(f"Backbone loaded from timm: {name} (pretrained={pretrained})")
+                return m, name
+            except Exception as e:
+                last_err = e
+                continue
+
+    raise RuntimeError(f"Failed to build backbone from timm. last_err={repr(last_err)}")
+
+# -------------------------
+# SegFormer-like model (decoder is stable even if backbone != MiT)
+# -------------------------
+class SegFormerLike(nn.Module):
+    def __init__(self, num_classes=2, embed_dim=256, use_last_n=4):
+        super().__init__()
+        self.backbone, self.backbone_name = build_backbone()
+        self.use_last_n = use_last_n
+
+        feat_channels = self.backbone.feature_info.channels()
+        feat_channels = feat_channels[-use_last_n:] if len(feat_channels) >= use_last_n else feat_channels
+
+        self.proj = nn.ModuleList([nn.Conv2d(c, embed_dim, kernel_size=1) for c in feat_channels])
+        self.fuse = nn.Sequential(
+            nn.Conv2d(embed_dim * len(feat_channels), embed_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(embed_dim, num_classes, kernel_size=1)
+        )
+
+    def forward(self, x):
+        feats = self.backbone(x)
+        feats = feats[-self.use_last_n:] if len(feats) >= self.use_last_n else feats
+        Ht, Wt = feats[0].shape[-2:]
+
+        ups = []
+        for f, p in zip(feats, self.proj):
+            z = p(f)
+            if z.shape[-2:] != (Ht, Wt):
+                z = F.interpolate(z, size=(Ht, Wt), mode="bilinear", align_corners=False)
+            ups.append(z)
+
+        zcat = torch.cat(ups, dim=1)
+        out = self.fuse(zcat)
+        return out  # [B,2,Ht,Wt]
+
+model = SegFormerLike(num_classes=2, embed_dim=256, use_last_n=4).to(DEVICE)
+logger.info(f"SegFormerLike backbone={model.backbone_name}")
+
+# -------------------------
+# AMP setup
+# -------------------------
+try:
+    from torch.amp import autocast, GradScaler
+    _AMP_NEW = True
+except Exception:
+    autocast = torch.cuda.amp.autocast
+    GradScaler = torch.cuda.amp.GradScaler
+    _AMP_NEW = False
+
+if _AMP_NEW:
+    scaler = GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
+else:
+    scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
+
+# -------------------------
+# LOSS: CE + Tversky (recall-lean)
+# -------------------------
+ce_loss = nn.CrossEntropyLoss()
+
+def tversky_loss_from_logits(logits, targets, alpha=0.4, beta=0.6, eps=1e-6):
+    probs = torch.softmax(logits, dim=1)[:, 1]
+    tgt = targets.float()
+    tp = (probs * tgt).sum(dim=(1,2))
+    fp = (probs * (1 - tgt)).sum(dim=(1,2))
+    fn = ((1 - probs) * tgt).sum(dim=(1,2))
+    tversky = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
+    return (1.0 - tversky).mean()
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+# -------------------------
+# METRICS
+# -------------------------
+def metrics_from_conf(tp, fp, fn, tn, beta2=1.0, eps=1e-9):
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    iou = tp / (tp + fp + fn + eps)
+    fbeta = (1 + beta2) * precision * recall / (beta2 * precision + recall + eps)
+    return {"precision": float(precision), "recall": float(recall), "iou": float(iou), "fbeta": float(fbeta)}
+
+@torch.no_grad()
+def tune_thr_auto_hist(bins=200, beta2=1.0):
+    model.eval()
+    hist_pos = torch.zeros(bins, dtype=torch.long, device=DEVICE)
+    hist_neg = torch.zeros(bins, dtype=torch.long, device=DEVICE)
+    total_pos = 0
+    total_neg = 0
+
+    for batch in val_loader:
+        x = batch["pixel_values"].to(DEVICE, non_blocking=True)
+        y = batch["labels"].to(DEVICE, non_blocking=True)
+
+        if _AMP_NEW:
+            with autocast(device_type="cuda", enabled=(DEVICE.type == "cuda")):
+                logits = model(x)
+        else:
+            with autocast(enabled=(DEVICE.type == "cuda")):
+                logits = model(x)
+
+        logits = F.interpolate(logits, size=y.shape[-2:], mode="bilinear", align_corners=False)
+        prob = torch.softmax(logits, dim=1)[:, 1]
+
+        idx = torch.clamp((prob * bins).long(), 0, bins - 1).view(-1)
+        yy = y.view(-1)
+
+        pos_mask = (yy == 1)
+        neg_mask = ~pos_mask
+
+        if pos_mask.any():
+            hist_pos += torch.bincount(idx[pos_mask], minlength=bins)
+            total_pos += int(pos_mask.sum().item())
+        if neg_mask.any():
+            hist_neg += torch.bincount(idx[neg_mask], minlength=bins)
+            total_neg += int(neg_mask.sum().item())
+
+    pos_rev = torch.flip(hist_pos.float(), dims=[0])
+    neg_rev = torch.flip(hist_neg.float(), dims=[0])
+    pos_cum = torch.flip(torch.cumsum(pos_rev, dim=0), dims=[0])
+    neg_cum = torch.flip(torch.cumsum(neg_rev, dim=0), dims=[0])
+
+    tp = pos_cum
+    fp = neg_cum
+    fn = float(total_pos) - tp
+    tn = float(total_neg) - fp
+
+    eps = 1e-9
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    fbeta = (1 + beta2) * precision * recall / (beta2 * precision + recall + eps)
+
+    best_k = int(torch.argmax(fbeta).item())
+    best_thr = best_k / float(bins)
+
+    m = metrics_from_conf(
+        tp=float(tp[best_k].item()),
+        fp=float(fp[best_k].item()),
+        fn=float(fn[best_k].item()),
+        tn=float(tn[best_k].item()),
+        beta2=beta2,
+        eps=1e-9
+    )
+    m["thr"] = float(best_thr)
+    m["bins"] = int(bins)
+    return best_thr, m
+
+# -------------------------
+# TRAIN with early stopping
+# -------------------------
+best_epoch = -1
+best_val = -1e9
+best_thr = 0.5
+bad = 0
+
+for epoch in range(1, MAX_EPOCH_CAP + 1):
+    model.train()
+    t0 = time.time()
+    total_loss = 0.0
+    steps = 0
+
+    for batch in train_loader:
+        x = batch["pixel_values"].to(DEVICE, non_blocking=True)
+        y = batch["labels"].to(DEVICE, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        if _AMP_NEW:
+            with autocast(device_type="cuda", enabled=(DEVICE.type == "cuda")):
+                logits = model(x)
+                logits = F.interpolate(logits, size=y.shape[-2:], mode="bilinear", align_corners=False)
+                loss = ce_loss(logits, y) + tversky_loss_from_logits(logits, y, alpha=0.4, beta=0.6)
+        else:
+            with autocast(enabled=(DEVICE.type == "cuda")):
+                logits = model(x)
+                logits = F.interpolate(logits, size=y.shape[-2:], mode="bilinear", align_corners=False)
+                loss = ce_loss(logits, y) + tversky_loss_from_logits(logits, y, alpha=0.4, beta=0.6)
+
+        if DEVICE.type == "cuda":
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        total_loss += float(loss.item())
+        steps += 1
+
+    train_loss = total_loss / max(1, steps)
+    thr, vm = tune_thr_auto_hist(bins=THR_BINS, beta2=BETA2)
+    val_score = vm["fbeta"]
+    dt = time.time() - t0
+
+    logger.info(
+        f"[Epoch {epoch:02d}] time={dt:.1f}s train_loss={train_loss:.4f} "
+        f"| VAL pixel-Fbeta={val_score:.6f} thr={thr:.3f} "
+        f"(IoU={vm['iou']:.4f} P={vm['precision']:.4f} R={vm['recall']:.4f})"
+    )
+
+    if val_score > best_val + EARLY_MIN_DELTA:
+        best_val = val_score
+        best_epoch = epoch
+        best_thr = float(thr)
+        bad = 0
+        torch.save(model.state_dict(), CKPT_PATH)
+        with open(META_PATH, "w", encoding="utf-8") as f:
+            json.dump(
+                {"best_epoch": best_epoch, "best_val_pixel_fbeta": best_val, "best_thr": best_thr, "val_metrics": vm},
+                f, ensure_ascii=False, indent=2
+            )
+        logger.info(f"[CKPT] Saved best model: epoch={best_epoch} val={best_val:.6f} thr={best_thr:.3f}")
+    else:
+        bad += 1
+        if bad >= EARLY_PATIENCE:
+            logger.info(f"[EARLY STOP] no improvement for {EARLY_PATIENCE} epochs. stop at epoch={epoch}. best_epoch={best_epoch}")
+            break
+
+# reload best
+if os.path.exists(CKPT_PATH):
+    model.load_state_dict(torch.load(CKPT_PATH, map_location=DEVICE))
+    model.eval()
+    if os.path.exists(META_PATH):
+        try:
+            meta = json.load(open(META_PATH, "r", encoding="utf-8"))
+            best_thr = float(meta.get("best_thr", best_thr))
+        except Exception:
+            pass
+logger.info(f"Use best_thr={best_thr:.3f} for inference")
+
+# -------------------------
+# Stage2 helpers
+# -------------------------
+@torch.no_grad()
+def predict_prob_map(batch_x: torch.Tensor) -> torch.Tensor:
+    if _AMP_NEW:
+        with autocast(device_type="cuda", enabled=(DEVICE.type == "cuda")):
+            logits = model(batch_x)
+    else:
+        with autocast(enabled=(DEVICE.type == "cuda")):
+            logits = model(batch_x)
+    logits = F.interpolate(logits, size=(IMG_SIZE, IMG_SIZE), mode="bilinear", align_corners=False)
+    prob = torch.softmax(logits, dim=1)[:, 1]
+    return prob
+
+def extract_components_features(prob_map: np.ndarray, bin_mask: np.ndarray) -> Tuple[np.ndarray, List[Tuple[slice, slice]]]:
+    lab, n = cc_label(bin_mask.astype(np.uint8))
+    if n == 0:
+        return np.zeros((0, 7), dtype=np.float32), []
+    objs = find_objects(lab)
+    feats = []
+    kept_slices = []
+    for i, sl in enumerate(objs, start=1):
+        if sl is None:
+            continue
+        rr, cc = sl
+        comp = (lab[rr, cc] == i)
+        area = float(comp.sum())
+        if area <= 0:
+            continue
+        h = float(rr.stop - rr.start)
+        w = float(cc.stop - cc.start)
+        bbox_area = max(1.0, h * w)
+        fill = area / bbox_area
+        asp = w / max(1.0, h)
+        p = prob_map[rr, cc][comp]
+        p_mean = float(p.mean()) if p.size else 0.0
+        p_max = float(p.max()) if p.size else 0.0
+        p90 = float(np.quantile(p, 0.90)) if p.size else 0.0
+        feats.append([area, w, h, asp, fill, p_mean, p_max + 0.5 * p90])
+        kept_slices.append(sl)
+    if len(feats) == 0:
+        return np.zeros((0, 7), dtype=np.float32), []
+    return np.asarray(feats, dtype=np.float32), kept_slices
+
+def build_gt_union_mask(img_id: str) -> np.ndarray:
+    path = os.path.join(TRAIN_IMG_DIR, img_id)
+    img = Image.open(path).convert("RGB")
+    W0, H0 = img.size
+    rles = IMG2RLES.get(img_id, [])
+    mask = np.zeros((H0, W0), dtype=np.uint8)
+    for rle in rles:
+        mask |= rle_decode(rle, (H0, W0))
+    mask_r = Image.fromarray(mask * 255).resize((IMG_SIZE, IMG_SIZE), resample=Image.NEAREST)
+    return (np.array(mask_r) > 127).astype(np.uint8)
+
+# -------------------------
+# Stage2: train tree on VAL proposals
+# -------------------------
+logger.info("[Stage2] Build proposal dataset on VAL...")
+X_list = []
+y_list = []
+
+proposal_thr = float(best_thr) * float(PROP_MULT)
+
+for batch in val_loader:
+    ids = batch["image_ids"]
+    x = batch["pixel_values"].to(DEVICE, non_blocking=True)
+    prob = predict_prob_map(x).detach().cpu().numpy()
+    for i, img_id in enumerate(ids):
+        prob_i = prob[i]
+        bin_i = (prob_i >= proposal_thr).astype(np.uint8)
+        feats, sls = extract_components_features(prob_i, bin_i)
+        if feats.shape[0] == 0:
+            continue
+        gt = build_gt_union_mask(img_id)
+        for j, sl in enumerate(sls):
+            rr, cc = sl
+            comp = (bin_i[rr, cc] == 1)
+            area = comp.sum()
+            if area <= 0:
+                lab = 0
+            else:
+                inter = (comp & (gt[rr, cc] == 1)).sum()
+                overlap = inter / max(1, area)
+                lab = 1 if overlap >= 0.5 else 0
+            X_list.append(feats[j])
+            y_list.append(lab)
+
+if len(X_list) < 200:
+    logger.warning(f"[Stage2] Too few proposal samples ({len(X_list)}). Skip tree training; will not filter instances.")
+    tree = None
+    tree_thr = 0.5
+else:
+    X = np.stack(X_list, axis=0)
+    y = np.asarray(y_list, dtype=np.int64)
+    logger.info(f"[Stage2] Proposal samples: N={len(y)} pos={int(y.sum())} neg={int((y==0).sum())}")
+
+    tree = HistGradientBoostingClassifier(
+        max_depth=6,
+        learning_rate=0.1,
+        max_iter=300,
+        early_stopping=True,
+        n_iter_no_change=20,
+        random_state=SEED
+    )
+    tree.fit(X, y)
+
+    proba = tree.predict_proba(X)[:, 1]
+    best_t = 0.5
+    best_s = -1e9
+    for t in TREE_PROB_THR_GRID:
+        pred = (proba >= t).astype(np.int64)
+        tp = int(((pred==1) & (y==1)).sum())
+        fp = int(((pred==1) & (y==0)).sum())
+        fn = int(((pred==0) & (y==1)).sum())
+        tn = int(((pred==0) & (y==0)).sum())
+        m = metrics_from_conf(tp, fp, fn, tn, beta2=TREE_BETA2)
+        if m["fbeta"] > best_s:
+            best_s = m["fbeta"]
+            best_t = float(t)
+    tree_thr = best_t
+    logger.info(f"[Stage2] Tree trained. tree_thr={tree_thr:.2f} component-Fbeta={best_s:.6f} (proxy)")
+
+    import pickle
+    with open(TREE_PATH, "wb") as f:
+        pickle.dump(tree, f)
+    with open(TREE_META, "w", encoding="utf-8") as f:
+        json.dump({"proposal_thr": proposal_thr, "tree_thr": tree_thr}, f, ensure_ascii=False, indent=2)
+
+# -------------------------
+# INFERENCE on TEST with template alignment
+# -------------------------
+@torch.no_grad()
+def predict_prob_for_image(img: Image.Image) -> Tuple[np.ndarray, Tuple[int,int]]:
+    img = img.convert("RGB")
+    orig_w, orig_h = img.size
+    img_r = img.resize((IMG_SIZE, IMG_SIZE), resample=Image.BILINEAR)
+    x = TF.to_tensor(img_r)
+    x = TF.normalize(x, MEAN, STD).unsqueeze(0).to(DEVICE)
+    prob = predict_prob_map(x).squeeze(0).detach().cpu().numpy()
+    return prob, (orig_w, orig_h)
+
+def instances_from_prob(prob: np.ndarray, thr_mask: float, tree_model, tree_thr: float) -> List[np.ndarray]:
+    bin_mask = (prob >= thr_mask).astype(np.uint8)
+    lab, n = cc_label(bin_mask)
+    if n == 0:
+        return []
+    objs = find_objects(lab)
+
+    feats_all = []
+    slices_all = []
+    comp_ids = []
+
+    for i, sl in enumerate(objs, start=1):
+        if sl is None:
+            continue
+        rr, cc = sl
+        comp = (lab[rr, cc] == i)
+        area = float(comp.sum())
+        if area <= 0:
+            continue
+        h = float(rr.stop - rr.start)
+        w = float(cc.stop - cc.start)
+        bbox_area = max(1.0, h * w)
+        fill = area / bbox_area
+        asp = w / max(1.0, h)
+        p = prob[rr, cc][comp]
+        p_mean = float(p.mean()) if p.size else 0.0
+        p_max  = float(p.max()) if p.size else 0.0
+        p90    = float(np.quantile(p, 0.90)) if p.size else 0.0
+        feats = np.asarray([area, w, h, asp, fill, p_mean, p_max + 0.5*p90], dtype=np.float32)
+
+        feats_all.append(feats)
+        slices_all.append(sl)
+        comp_ids.append(i)
+
+    if len(feats_all) == 0:
+        return []
+
+    keep = np.ones((len(feats_all),), dtype=bool)
+    if tree_model is not None:
+        Xc = np.stack(feats_all, axis=0)
+        proba = tree_model.predict_proba(Xc)[:, 1]
+        keep = (proba >= tree_thr)
+
+    inst_masks = []
+    for k, sl, cid in zip(keep, slices_all, comp_ids):
+        if not k:
+            continue
+        rr, cc = sl
+        comp = (lab[rr, cc] == cid)
+        m = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint8)
+        m[rr, cc] = comp.astype(np.uint8)
+        inst_masks.append(m)
+
+    return inst_masks
+
+def resize_mask_to_orig(inst_mask: np.ndarray, orig_wh: Tuple[int,int]) -> np.ndarray:
+    orig_w, orig_h = orig_wh
+    m_img = Image.fromarray((inst_mask * 255).astype(np.uint8)).resize((orig_w, orig_h), resample=Image.NEAREST)
+    return (np.array(m_img) > 127).astype(np.uint8)
+
+logger.info("[TEST] Start inference...")
+model.eval()
+
+template_ids = template["ImageId"].astype(str).tolist()
+rows_by_id: Dict[str, List[int]] = {}
+for idx, img_id in enumerate(template_ids):
+    rows_by_id.setdefault(img_id, []).append(idx)
+
+unique_ids = list(rows_by_id.keys())
+logger.info(f"Template rows={len(template)} unique ImageId={len(unique_ids)}")
+
+out = template.copy()
+out["EncodedPixels"] = ""
+
+non_empty_inst = 0
+
+for k, img_id in enumerate(unique_ids):
+    img_path = os.path.join(TEST_IMG_DIR, img_id)
+    if not os.path.exists(img_path):
+        continue
+
+    try:
+        img = Image.open(img_path).convert("RGB")
+        prob, orig_wh = predict_prob_for_image(img)
+        insts = instances_from_prob(prob, thr_mask=best_thr, tree_model=tree, tree_thr=tree_thr)
+
+        rles = []
+        for inst in insts:
+            m = resize_mask_to_orig(inst, orig_wh)
+            r = rle_encode(m)
+            if r != "":
+                rles.append(r)
+
+        rows = rows_by_id[img_id]
+        for j, row_idx in enumerate(rows):
+            if j < len(rles):
+                out.at[row_idx, "EncodedPixels"] = rles[j]
+            else:
+                out.at[row_idx, "EncodedPixels"] = ""
+        non_empty_inst += len(rles)
+
+    except Exception as e:
+        if k < 5:
+            logger.warning(f"[TEST] infer failed for {img_id}: {repr(e)}")
+        rows = rows_by_id[img_id]
+        for row_idx in rows:
+            out.at[row_idx, "EncodedPixels"] = ""
+
+    if (k + 1) % 1000 == 0:
+        logger.info(f"[TEST] progress {k+1}/{len(unique_ids)}")
+
+out.to_csv(SUB_PATH, index=False)
+size = os.path.getsize(SUB_PATH) if os.path.exists(SUB_PATH) else 0
+logger.info(f"[DONE] submission={SUB_PATH} rows={len(out)} bytes={size} non_empty_instances={non_empty_inst}")
+
+print("READY:", SUB_PATH)
+print("rows:", len(out), "bytes:", size, "non_empty_instances:", int(non_empty_inst))
+print(out.head())
+with open(SUB_PATH, "rb") as f:
+    print("file head bytes:", f.read(64))
+print("LOG:", LOG_PATH)
+print("CKPT:", CKPT_PATH if os.path.exists(CKPT_PATH) else "N/A")
+print("META:", META_PATH if os.path.exists(META_PATH) else "N/A")
+print("TREE:", TREE_PATH if os.path.exists(TREE_PATH) else "N/A")
+print("TREE_META:", TREE_META if os.path.exists(TREE_META) else "N/A")
