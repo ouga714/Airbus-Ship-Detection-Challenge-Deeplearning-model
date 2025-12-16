@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Swin Transformer + UPerNet (HF Transformers) for Airbus Ship Detection (momos/env_airbus)
+
+What you asked:
+- Use original resolution (768x768), NOT crop-based training/eval
+- Split sampled 20,000 images into train/val/test (holdout test)
+- Train until validation saturates (Early Stopping)
+- Report visible metrics on HOLDOUT TEST: Precision / Recall / F1 / IoU (pixel-level)
+- Threshold tuning on VAL to maximize F1 (grid search)
+
+Default data root (memory-based):
+  /workspace/kaggle_competition/airbus-ship-detection
+
+Expected structure:
+  /workspace/kaggle_competition/airbus-ship-detection/
+    train_v2/
+    test_v2/
+    train_ship_segmentations_v2.csv
+    sample_submission_v2.csv
+
+Notes:
+- Metrics here are pixel-level for binary semantic segmentation (ship vs background).
+- HOLDOUT TEST here is a split from train_v2 (not Kaggle test_v2).
+"""
+
+import os
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["TRANSFORMERS_NO_FLAX"] = "1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
+import sys
+import json
+import time
+import random
+import argparse
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+import cv2
+from skimage.measure import label as sk_label
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+
+try:
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+except Exception as e:
+    raise RuntimeError(
+        "albumentations not available. Install in container: pip install albumentations opencv-python-headless"
+    ) from e
+
+try:
+    from transformers import AutoImageProcessor, UperNetForSemanticSegmentation
+except Exception as e:
+    raise RuntimeError(
+        "transformers not available. Install in container: pip install transformers timm"
+    ) from e
+
+
+# -------------------------
+# Utilities
+# -------------------------
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
+
+def now_tag() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def build_logger(log_file: Path) -> logging.Logger:
+    logger = logging.getLogger("train")
+    logger.setLevel(logging.INFO)
+    logger.handlers = []
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    return logger
+
+
+# -------------------------
+# Airbus RLE
+# -------------------------
+
+def rle_decode(rle: str, shape=(768, 768)) -> np.ndarray:
+    """
+    Airbus RLE: 1-indexed, column-major (flatten mask.T)
+    returns (H,W) uint8 {0,1}
+    """
+    if rle is None or (isinstance(rle, float) and np.isnan(rle)) or rle == "":
+        return np.zeros(shape, dtype=np.uint8)
+    s = rle.strip().split()
+    starts, lengths = [np.asarray(x, dtype=np.int64) for x in (s[0::2], s[1::2])]
+    starts -= 1
+    ends = starts + lengths
+    img = np.zeros(shape[0] * shape[1], dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        img[lo:hi] = 1
+    return img.reshape((shape[1], shape[0])).T
+
+
+def masks_from_rles(rles: List[str], shape=(768, 768)) -> np.ndarray:
+    m = np.zeros(shape, dtype=np.uint8)
+    for r in rles:
+        if isinstance(r, str) and len(r) > 0:
+            m |= rle_decode(r, shape)
+    return m
+
+
+# -------------------------
+# Pixel metrics
+# -------------------------
+
+def fast_confusion(pred01: np.ndarray, gt01: np.ndarray) -> Tuple[int, int, int, int]:
+    pred = pred01.reshape(-1).astype(np.uint8)
+    gt = gt01.reshape(-1).astype(np.uint8)
+    tp = int(((pred == 1) & (gt == 1)).sum())
+    tn = int(((pred == 0) & (gt == 0)).sum())
+    fp = int(((pred == 1) & (gt == 0)).sum())
+    fn = int(((pred == 0) & (gt == 1)).sum())
+    return tp, tn, fp, fn
+
+
+def prf_iou_from_conf(tp: int, fp: int, fn: int) -> Dict[str, float]:
+    eps = 1e-9
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+    iou = tp / (tp + fp + fn + eps)
+    return {
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "iou": float(iou),
+    }
+
+
+def remove_small_components(mask01: np.ndarray, min_area: int) -> np.ndarray:
+    """
+    Postprocess: remove connected components smaller than min_area.
+    If min_area <= 0, returns original.
+    """
+    if min_area <= 0:
+        return mask01.astype(np.uint8)
+    lab = sk_label(mask01.astype(np.uint8), connectivity=1)
+    out = np.zeros_like(mask01, dtype=np.uint8)
+    mx = int(lab.max())
+    for i in range(1, mx + 1):
+        comp = (lab == i)
+        if int(comp.sum()) >= int(min_area):
+            out[comp] = 1
+    return out
+
+
+@torch.no_grad()
+def evaluate_pixel_metrics(
+    model,
+    loader,
+    device,
+    thr: float,
+    amp: bool,
+    min_area: int = 0,
+    max_images: int = 0
+) -> Dict[str, float]:
+    """
+    Pixel-level metrics over the loader:
+      Precision / Recall / F1 / IoU
+    """
+    model.eval()
+    tot_tp = tot_fp = tot_fn = 0
+    n_seen = 0
+
+    for x, y, ids in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
+            out = model(pixel_values=x)
+            logits = out.logits  # [B,2,H,W]
+            prob = torch.softmax(logits, dim=1)[:, 1, :, :]  # ship prob
+
+        pred = (prob > thr).to(torch.uint8)
+
+        for b in range(pred.size(0)):
+            pred01 = pred[b].detach().cpu().numpy().astype(np.uint8)
+            gt01 = (y[b].detach().cpu().numpy().astype(np.uint8) > 0).astype(np.uint8)
+
+            pred01 = remove_small_components(pred01, min_area=min_area)
+
+            tp, tn, fp, fn = fast_confusion(pred01, gt01)
+            tot_tp += tp
+            tot_fp += fp
+            tot_fn += fn
+
+            n_seen += 1
+            if max_images > 0 and n_seen >= max_images:
+                break
+        if max_images > 0 and n_seen >= max_images:
+            break
+
+    m = prf_iou_from_conf(tot_tp, tot_fp, tot_fn)
+    m["tp"] = int(tot_tp)
+    m["fp"] = int(tot_fp)
+    m["fn"] = int(tot_fn)
+    m["n_images_eval"] = int(n_seen)
+    m["thr"] = float(thr)
+    m["min_area"] = int(min_area)
+    return m
+
+
+@torch.no_grad()
+def tune_threshold_for_f1(
+    model,
+    loader,
+    device,
+    amp: bool,
+    thr_start: float,
+    thr_end: float,
+    thr_step: float,
+    min_area: int,
+    tune_max_images: int
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Grid search threshold to maximize VAL F1 (pixel-level).
+    """
+    best_thr = 0.5
+    best_f1 = -1.0
+    best_metrics: Optional[Dict[str, float]] = None
+
+    thrs = np.arange(thr_start, thr_end + 1e-9, thr_step, dtype=np.float32)
+    for t in thrs:
+        metrics = evaluate_pixel_metrics(
+            model=model,
+            loader=loader,
+            device=device,
+            thr=float(t),
+            amp=amp,
+            min_area=min_area,
+            max_images=tune_max_images
+        )
+        if metrics["f1"] > best_f1:
+            best_f1 = float(metrics["f1"])
+            best_thr = float(t)
+            best_metrics = metrics
+
+    assert best_metrics is not None
+    return best_thr, best_metrics
+
+
+# -------------------------
+# Transforms / Dataset (FULL 768)
+# -------------------------
+
+def get_train_tfms_full768():
+    # Keep resolution; only geometric/photometric transforms that preserve size.
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.RandomBrightnessContrast(p=0.3),
+        A.GaussNoise(p=0.2),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+
+def get_eval_tfms_full768():
+    return A.Compose([
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+
+class AirbusUnionSegDataset(Dataset):
+    """
+    Semantic segmentation with union mask (ship/background).
+    Full resolution (768x768).
+    """
+    def __init__(self, image_ids: List[str], img_dir: Path, rle_map: Dict[str, List[str]], tfms):
+        self.image_ids = list(image_ids)
+        self.img_dir = img_dir
+        self.rle_map = rle_map
+        self.tfms = tfms
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx: int):
+        image_id = self.image_ids[idx]
+        img_path = self.img_dir / image_id
+        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(f"Image not found: {img_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        rles = self.rle_map.get(image_id, [])
+        mask = masks_from_rles([x for x in rles if isinstance(x, str)], shape=(768, 768)).astype(np.uint8)
+
+        out = self.tfms(image=img, mask=mask)
+        x = out["image"]              # float32 [3,768,768]
+        y = out["mask"].long()        # int64  [768,768] {0,1}
+        return x, y, image_id
+
+
+# -------------------------
+# Training
+# -------------------------
+
+def estimate_pixel_pos_ratio(ds: Dataset, n: int = 100) -> float:
+    n = min(n, len(ds))
+    pos = 0
+    tot = 0
+    for i in range(n):
+        _, y, _ = ds[i]
+        y_np = y.numpy()
+        pos += int((y_np == 1).sum())
+        tot += int(y_np.size)
+    return float(pos / max(tot, 1))
+
+
+def train_one_epoch(model, loader, optimizer, criterion, scaler, device, amp: bool, grad_accum: int) -> float:
+    model.train()
+    running = 0.0
+    n = 0
+
+    optimizer.zero_grad(set_to_none=True)
+    for step, (x, y, ids) in enumerate(loader, start=1):
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        with torch.cuda.amp.autocast(enabled=(amp and device.type == "cuda")):
+            out = model(pixel_values=x)
+            logits = out.logits
+            loss = criterion(logits, y) / max(grad_accum, 1)
+
+        scaler.scale(loss).backward()
+
+        if step % max(grad_accum, 1) == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        running += float(loss.detach().cpu().item()) * max(grad_accum, 1)
+        n += 1
+
+    return running / max(n, 1)
+
+
+# -------------------------
+# Config / Main
+# -------------------------
+
+@dataclass
+class CFG:
+    data_root: str
+    out_dir: str
+    seed: int
+
+    hf_ckpt: str
+    num_labels: int
+
+    max_train_images: int
+    val_ratio: float
+    test_ratio: float
+
+    epochs_max: int
+    min_epochs: int
+    patience: int
+    min_delta: float
+
+    lr: float
+    weight_decay: float
+
+    batch_size: int
+    eval_batch_size: int
+    grad_accum: int
+    amp: bool
+    num_workers: int
+
+    prefer_positive_weight: float
+
+    thr_start: float
+    thr_end: float
+    thr_step: float
+    tune_max_images: int
+
+    min_area: int
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-root", type=str, default="/workspace/kaggle_competition/airbus-ship-detection")
+    ap.add_argument("--out-dir", type=str, default="")
+    ap.add_argument("--seed", type=int, default=42)
+
+    ap.add_argument("--hf-ckpt", type=str, default="openmmlab/upernet-swin-tiny")
+
+    ap.add_argument("--max-train-images", type=int, default=20000)
+    ap.add_argument("--val-ratio", type=float, default=0.15)
+    ap.add_argument("--test-ratio", type=float, default=0.15)
+
+    ap.add_argument("--epochs-max", type=int, default=200)
+    ap.add_argument("--min-epochs", type=int, default=6)
+    ap.add_argument("--patience", type=int, default=10)
+    ap.add_argument("--min-delta", type=float, default=1e-4)
+
+    ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--weight-decay", type=float, default=1e-2)
+
+    # Full 768 tends to be heavy; default safer.
+    ap.add_argument("--batch-size", type=int, default=2)
+    ap.add_argument("--eval-batch-size", type=int, default=2)
+    ap.add_argument("--grad-accum", type=int, default=4)
+
+    ap.add_argument("--amp", action="store_true")
+    ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--num-workers", type=int, default=4)
+
+    ap.add_argument("--prefer-positive-weight", type=float, default=5.0)
+
+    ap.add_argument("--thr-start", type=float, default=0.05)
+    ap.add_argument("--thr-end", type=float, default=0.95)
+    ap.add_argument("--thr-step", type=float, default=0.05)
+    ap.add_argument("--tune-max-images", type=int, default=2000)
+
+    ap.add_argument("--min-area", type=int, default=0)
+
+    args = ap.parse_args()
+
+    if args.no_amp:
+        amp = False
+    else:
+        amp = bool(args.amp) or True  # default ON unless explicitly disabled
+
+    cfg = CFG(
+        data_root=args.data_root,
+        out_dir=args.out_dir,
+        seed=args.seed,
+        hf_ckpt=args.hf_ckpt,
+        num_labels=2,
+        max_train_images=args.max_train_images,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        epochs_max=args.epochs_max,
+        min_epochs=args.min_epochs,
+        patience=args.patience,
+        min_delta=args.min_delta,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        batch_size=args.batch_size,
+        eval_batch_size=args.eval_batch_size,
+        grad_accum=args.grad_accum,
+        amp=amp,
+        num_workers=args.num_workers,
+        prefer_positive_weight=args.prefer_positive_weight,
+        thr_start=args.thr_start,
+        thr_end=args.thr_end,
+        thr_step=args.thr_step,
+        tune_max_images=args.tune_max_images,
+        min_area=args.min_area,
+    )
+
+    if not (0.0 < cfg.val_ratio < 1.0) or not (0.0 < cfg.test_ratio < 1.0) or (cfg.val_ratio + cfg.test_ratio >= 1.0):
+        raise ValueError("Require: 0<val_ratio<1, 0<test_ratio<1, and val_ratio+test_ratio < 1.")
+
+    set_seed(cfg.seed)
+
+    data_root = Path(cfg.data_root)
+    train_csv = data_root / "train_ship_segmentations_v2.csv"
+    train_dir = data_root / "train_v2"
+
+    if not train_csv.exists():
+        raise FileNotFoundError(f"Missing: {train_csv}")
+    if not train_dir.exists():
+        raise FileNotFoundError(f"Missing: {train_dir}")
+
+    out_base = Path(cfg.out_dir) if cfg.out_dir else (data_root / "outputs" / f"upernet_swin20k_full768__{now_tag()}__seed{cfg.seed}")
+    ensure_dir(out_base)
+    logger = build_logger(out_base / "run.log")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("=== ENV ===")
+    logger.info(f"device={device}")
+    logger.info(f"torch={torch.__version__}")
+    if device.type == "cuda":
+        logger.info(f"cuda_device_count={torch.cuda.device_count()}")
+        logger.info(f"cuda_name={torch.cuda.get_device_name(0)}")
+
+    logger.info("=== PATHS ===")
+    logger.info(f"data_root={data_root}")
+    logger.info(f"train_csv={train_csv}")
+    logger.info(f"train_dir={train_dir}")
+    logger.info(f"out_dir={out_base}")
+
+    df = pd.read_csv(train_csv)
+    grp = df.groupby("ImageId")["EncodedPixels"].apply(list).to_dict()
+
+    all_image_ids = np.array(sorted(grp.keys()))
+    has_ship = np.array(
+        [1 if len([x for x in grp[i] if isinstance(x, str)]) > 0 else 0 for i in all_image_ids],
+        dtype=np.int64
+    )
+
+    n_total = len(all_image_ids)
+    n_pos = int(has_ship.sum())
+    n_neg = int(n_total - n_pos)
+    logger.info("=== DATA STATS ===")
+    logger.info(f"unique_images={n_total:,} pos_images={n_pos:,} neg_images={n_neg:,} pos_rate={n_pos/max(n_total,1):.4f}")
+
+    # --- sample 20,000 images stratified by image-level pos/neg
+    target = int(min(cfg.max_train_images, n_total))
+    pos_target = int(round(target * (n_pos / max(n_total, 1))))
+    pos_target = max(1, min(pos_target, n_pos))
+    neg_target = target - pos_target
+    neg_target = max(1, min(neg_target, n_neg))
+
+    rng = np.random.RandomState(cfg.seed)
+    pos_ids = all_image_ids[has_ship == 1]
+    neg_ids = all_image_ids[has_ship == 0]
+    sampled_pos = rng.choice(pos_ids, size=pos_target, replace=False)
+    sampled_neg = rng.choice(neg_ids, size=neg_target, replace=False)
+    sampled_ids = np.concatenate([sampled_pos, sampled_neg])
+    rng.shuffle(sampled_ids)
+
+    sampled_has_ship = np.array(
+        [1 if len([x for x in grp[i] if isinstance(x, str)]) > 0 else 0 for i in sampled_ids],
+        dtype=np.int64
+    )
+    logger.info("=== SAMPLE ===")
+    logger.info(f"sampled_images={len(sampled_ids):,} sampled_pos={int(sampled_has_ship.sum()):,} sampled_neg={int((1-sampled_has_ship).sum()):,}")
+
+    # --- train/val/test split (stratified)
+    from sklearn.model_selection import train_test_split
+
+    valtest_ratio = cfg.val_ratio + cfg.test_ratio
+    train_ids, temp_ids = train_test_split(
+        sampled_ids,
+        test_size=valtest_ratio,
+        random_state=cfg.seed,
+        stratify=sampled_has_ship
+    )
+
+    temp_has_ship = np.array(
+        [1 if len([x for x in grp[i] if isinstance(x, str)]) > 0 else 0 for i in temp_ids],
+        dtype=np.int64
+    )
+    # split temp into val/test with relative ratio
+    test_rel = cfg.test_ratio / valtest_ratio
+    val_ids, test_ids = train_test_split(
+        temp_ids,
+        test_size=test_rel,
+        random_state=cfg.seed,
+        stratify=temp_has_ship
+    )
+
+    train_ids = list(train_ids)
+    val_ids = list(val_ids)
+    test_ids = list(test_ids)
+
+    def count_pos(ids: List[str]) -> int:
+        c = 0
+        for i in ids:
+            rles = grp.get(i, [])
+            c += 1 if len([x for x in rles if isinstance(x, str)]) > 0 else 0
+        return int(c)
+
+    logger.info("=== SPLIT (IMAGE-LEVEL) ===")
+    logger.info(f"train={len(train_ids):,} pos={count_pos(train_ids):,}")
+    logger.info(f"val  ={len(val_ids):,} pos={count_pos(val_ids):,}")
+    logger.info(f"test ={len(test_ids):,} pos={count_pos(test_ids):,}")
+
+    # --- transforms (FULL 768)
+    train_tfms = get_train_tfms_full768()
+    eval_tfms = get_eval_tfms_full768()
+
+    train_ds = AirbusUnionSegDataset(train_ids, train_dir, grp, train_tfms)
+    val_ds = AirbusUnionSegDataset(val_ids, train_dir, grp, eval_tfms)
+    test_ds = AirbusUnionSegDataset(test_ids, train_dir, grp, eval_tfms)
+
+    # --- sampler: prefer positive images in training
+    train_weights = []
+    for image_id in train_ids:
+        rles = grp.get(image_id, [])
+        pos = 1 if len([x for x in rles if isinstance(x, str)]) > 0 else 0
+        w = cfg.prefer_positive_weight if pos == 1 else 1.0
+        train_weights.append(float(w))
+    sampler = WeightedRandomSampler(weights=train_weights, num_samples=len(train_weights), replacement=True)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        sampler=sampler,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=True
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg.eval_batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=cfg.eval_batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True
+    )
+
+    # --- model
+    logger.info("=== MODEL ===")
+    logger.info(f"hf_ckpt={cfg.hf_ckpt} num_labels={cfg.num_labels} amp={cfg.amp}")
+    _ = AutoImageProcessor.from_pretrained(cfg.hf_ckpt)
+
+    model = UperNetForSemanticSegmentation.from_pretrained(
+        cfg.hf_ckpt,
+        num_labels=cfg.num_labels,
+        ignore_mismatched_sizes=True
+    )
+    model.to(device)
+
+    # --- loss: class-weighted CE using rough pixel pos ratio
+    pos_ratio = estimate_pixel_pos_ratio(train_ds, n=100)
+    # ship weight: inverse-ish; clip to avoid explosion
+    w_ship = float(np.clip(0.5 / max(pos_ratio, 1e-6), 1.0, 50.0))
+    class_weights = torch.tensor([1.0, w_ship], device=device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    logger.info(f"loss=CrossEntropy(weight=[1.0, {w_ship:.3f}]) approx_pixel_pos_ratio={pos_ratio:.8f}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and device.type == "cuda"))
+
+    BEST_MODEL = out_base / "best_model.pth"
+    BEST_JSON = out_base / "best_summary.json"
+
+    # --- early stopping on VAL F1 (pixel-level, with tuned threshold)
+    best_val_f1 = -1.0
+    best_thr = 0.5
+    best_epoch = -1
+    bad_epochs = 0
+
+    logger.info("=== TRAIN START ===")
+    logger.info(f"max_epochs={cfg.epochs_max} min_epochs={cfg.min_epochs} patience={cfg.patience} min_delta={cfg.min_delta}")
+    logger.info(f"train_batch={cfg.batch_size} eval_batch={cfg.eval_batch_size} grad_accum={cfg.grad_accum} min_area={cfg.min_area}")
+
+    for epoch in range(1, cfg.epochs_max + 1):
+        t0 = time.time()
+        train_loss = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            scaler=scaler,
+            device=device,
+            amp=cfg.amp,
+            grad_accum=cfg.grad_accum
+        )
+        dt = time.time() - t0
+
+        # tune threshold on VAL to maximize F1 (quick if tune_max_images > 0)
+        thr, val_metrics_tuned = tune_threshold_for_f1(
+            model=model,
+            loader=val_loader,
+            device=device,
+            amp=cfg.amp,
+            thr_start=cfg.thr_start,
+            thr_end=cfg.thr_end,
+            thr_step=cfg.thr_step,
+            min_area=cfg.min_area,
+            tune_max_images=cfg.tune_max_images
+        )
+
+        # full val eval with tuned thr
+        val_metrics = evaluate_pixel_metrics(
+            model=model,
+            loader=val_loader,
+            device=device,
+            thr=thr,
+            amp=cfg.amp,
+            min_area=cfg.min_area,
+            max_images=0
+        )
+
+        logger.info(
+            f"[Epoch {epoch:03d}/{cfg.epochs_max:03d}] time={dt:.1f}s "
+            f"train_loss={train_loss:.4f} "
+            f"VAL thr={thr:.2f} | P={val_metrics['precision']:.4f} R={val_metrics['recall']:.4f} "
+            f"F1={val_metrics['f1']:.4f} IoU={val_metrics['iou']:.4f} "
+            f"(tp={val_metrics['tp']}, fp={val_metrics['fp']}, fn={val_metrics['fn']})"
+        )
+
+        improved = (val_metrics["f1"] > best_val_f1 + cfg.min_delta)
+        if improved:
+            best_val_f1 = float(val_metrics["f1"])
+            best_thr = float(thr)
+            best_epoch = int(epoch)
+            bad_epochs = 0
+
+            torch.save(model.state_dict(), BEST_MODEL)
+            summary = {
+                "seed": cfg.seed,
+                "hf_ckpt": cfg.hf_ckpt,
+                "best_epoch": best_epoch,
+                "best_thr": best_thr,
+                "best_val_metrics": val_metrics,
+                "data_root": str(data_root),
+                "train_sample_images": int(len(sampled_ids)),
+                "split": {
+                    "train": int(len(train_ids)),
+                    "val": int(len(val_ids)),
+                    "test": int(len(test_ids)),
+                },
+                "note": "Validation metric for early stopping is pixel-level F1 on full 768x768 (no crop).",
+            }
+            with open(BEST_JSON, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+
+            logger.info(f"[BEST] epoch={best_epoch} best_val_F1={best_val_f1:.4f} best_thr={best_thr:.2f} saved={BEST_MODEL}")
+        else:
+            bad_epochs += 1
+            logger.info(f"[EARLYSTOP] no improvement: bad_epochs={bad_epochs}/{cfg.patience}")
+
+        if epoch >= cfg.min_epochs and bad_epochs >= cfg.patience:
+            logger.info(f"[EARLYSTOP] STOP at epoch={epoch} best_epoch={best_epoch} best_val_F1={best_val_f1:.4f}")
+            break
+
+    logger.info("=== TRAIN END ===")
+    logger.info(f"best_epoch={best_epoch} best_val_F1={best_val_f1:.4f} best_thr={best_thr:.2f}")
+    logger.info(f"best_model={BEST_MODEL}")
+    logger.info(f"best_json ={BEST_JSON}")
+
+    # --- Evaluate on HOLDOUT TEST (visible metrics)
+    if BEST_MODEL.exists():
+        model.load_state_dict(torch.load(BEST_MODEL, map_location=device))
+        logger.info(f"[LOAD] loaded best model for TEST: {BEST_MODEL}")
+    else:
+        logger.info("[WARN] best model not found; using last weights for TEST evaluation.")
+
+    test_metrics = evaluate_pixel_metrics(
+        model=model,
+        loader=test_loader,
+        device=device,
+        thr=best_thr,
+        amp=cfg.amp,
+        min_area=cfg.min_area,
+        max_images=0
+    )
+
+    logger.info("=== HOLDOUT TEST METRICS (PIXEL) ===")
+    logger.info(
+        f"TEST thr={best_thr:.2f} | P={test_metrics['precision']:.4f} R={test_metrics['recall']:.4f} "
+        f"F1={test_metrics['f1']:.4f} IoU={test_metrics['iou']:.4f} "
+        f"(tp={test_metrics['tp']}, fp={test_metrics['fp']}, fn={test_metrics['fn']})"
+    )
+
+    # Save test metrics
+    test_json = out_base / "holdout_test_metrics.json"
+    with open(test_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "best_epoch": best_epoch,
+                "best_thr": best_thr,
+                "val_best_f1": best_val_f1,
+                "holdout_test_metrics": test_metrics,
+                "min_area": cfg.min_area,
+                "note": "Holdout test is a split from train_v2 (not Kaggle test_v2). Metrics are pixel-level.",
+            },
+            f,
+            indent=2
+        )
+    logger.info(f"[SAVE] holdout_test_metrics: {test_json}")
+
+
+if __name__ == "__main__":
+    main()
