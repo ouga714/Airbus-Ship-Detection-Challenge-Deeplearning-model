@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+FULL (robust, momos):
+DeepLabv3+ (train=85%) + HGBDT (component filter) with val split into 3 disjoint parts:
+  - val_seg        : early stopping + best_thr (pixel F2-proxy)
+  - val_tree_train : build component dataset + train HGBDT
+  - val_tree_calib : tune tree_thr + visualization
+
+No internal test split (as requested).
+Dataset population is enumerated from TRAIN_IMG_DIR (full dir), not CSV keys.
+
+Outputs (out_dir):
+  - best_model.pth (seg)
+  - tree_model.joblib (HGBDT)
+  - tree_meta.json (thresholds, metrics, counts)
+  - split_ids.json (train/val_seg/val_tree_train/val_tree_calib)
+  - plots:
+      seg_prob_hist.png
+      tree_prob_hist.png
+      tree_perm_importance.png
+"""
+
+import os
+import csv
+import time
+import json
+import random
+import datetime
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision.io import read_image, ImageReadMode
+import torchvision.transforms.functional as TVF
+
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# AMP new API (prefer torch.amp, fallback to torch.cuda.amp)
+try:
+    from torch.amp import autocast, GradScaler
+    _AMP_NEW = True
+except Exception:
+    autocast = torch.cuda.amp.autocast  # type: ignore
+    GradScaler = torch.cuda.amp.GradScaler  # type: ignore
+    _AMP_NEW = False
+
+# sklearn tree + save + viz
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.inspection import permutation_importance
+import joblib
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# optional CC backend
+CC_BACKEND = None
+try:
+    import cv2
+    CC_BACKEND = "cv2"
+except Exception:
+    try:
+        from scipy import ndimage as ndi  # type: ignore
+        CC_BACKEND = "scipy"
+    except Exception:
+        CC_BACKEND = None
+
+
+# =========================
+# CONFIG
+# =========================
+SEED = 42
+
+# --- path detect (momos container commonly mounts host project to /workspace/airbus) ---
+# You previously confirmed: host /home/ouga/kaggle_competition/airbus-ship-detection -> container /workspace/airbus
+CAND_ROOTS = [
+    "/workspace/airbus",
+    "/workspace/kaggle_competition/airbus-ship-detection",
+]
+DATA_DIR = None
+for r in CAND_ROOTS:
+    if os.path.isdir(r):
+        DATA_DIR = r
+        break
+if DATA_DIR is None:
+    raise RuntimeError(f"DATA_DIR not found. Tried: {CAND_ROOTS}")
+
+TRAIN_IMG_DIR = os.path.join(DATA_DIR, "train_v2")
+TRAIN_CSV = os.path.join(DATA_DIR, "train_ship_segmentations_v2.csv")
+
+# sizes
+TRAIN_SIZE = 512
+INFER_SIZE = 768  # tree stage (proposal components) uses higher res
+
+# split
+TRAIN_FRAC = 0.85  # train:val=85:15
+# val will be split into 3 equal disjoint parts (no caps)
+#  - val_seg (thr/early stop)
+#  - val_tree_train (tree train)
+#  - val_tree_calib (tree calib)
+
+# training
+MAX_EPOCHS = 50
+EARLY_PATIENCE = 6
+MIN_EPOCHS_BEFORE_STOP = 4
+
+BATCH_TRAIN = 4
+BATCH_EVAL  = 4
+BATCH_TREE  = 4
+
+LR = 1e-4
+WEIGHT_DECAY = 1e-4
+
+# Tversky (recall>precision)
+TV_ALPHA = 0.4
+TV_BETA  = 0.6
+
+# threshold search (seg)
+THR_GRID = [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60]
+
+# component filtering
+MIN_COMP_AREA = 10
+COMP_POS_OVERLAP = 0.5  # overlap >= 0.5 => component positive
+MIN_MASK_AREA_TO_RLE = 10  # (not used now; kept for consistency)
+
+# robustness toggles
+FREEZE_BN = True
+AMP_ENABLE = True
+MAX_SKIP_TRIES = 8
+
+OUT_ROOT = os.path.join(DATA_DIR, "output_runs_full85")
+PERSISTENT_WORKERS = True
+
+
+# =========================
+# Utilities
+# =========================
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def now_tag() -> str:
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def list_image_ids_from_dir(img_dir: str) -> List[str]:
+    # Airbus uses .jpg
+    ids = []
+    for fn in os.listdir(img_dir):
+        if fn.lower().endswith(".jpg"):
+            ids.append(fn)
+    ids.sort()
+    return ids
+
+def safe_read_image_rgb(path: str) -> Optional[torch.Tensor]:
+    """
+    Returns float tensor CxHxW in [0,1] or None if failed.
+    """
+    try:
+        img = read_image(path, mode=ImageReadMode.RGB)  # uint8 CxHxW
+        return img.float() / 255.0
+    except Exception:
+        pass
+
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            t = TVF.pil_to_tensor(im).float() / 255.0
+            return t
+    except Exception:
+        pass
+
+    if CC_BACKEND == "cv2":
+        try:
+            bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+            if bgr is None:
+                return None
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            t = torch.from_numpy(rgb).permute(2, 0, 1).contiguous().float() / 255.0
+            return t
+        except Exception:
+            return None
+
+    return None
+
+def rle_decode_one(rle: str, shape: Tuple[int, int] = (768, 768)) -> np.ndarray:
+    if rle is None or rle == "" or str(rle).lower() == "nan":
+        return np.zeros(shape, dtype=np.uint8)
+    s = rle.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    flat = np.zeros(shape[0] * shape[1], dtype=np.uint8)
+    for st, en in zip(starts, ends):
+        if st >= flat.size:
+            continue
+        en = min(en, flat.size)
+        flat[st:en] = 1
+    mask = flat.reshape((shape[1], shape[0]), order="C").T
+    return mask
+
+def rle_decode_many(rles: List[str], shape: Tuple[int, int] = (768, 768)) -> np.ndarray:
+    if not rles:
+        return np.zeros(shape, dtype=np.uint8)
+    m = np.zeros(shape, dtype=np.uint8)
+    for r in rles:
+        rr = str(r) if r is not None else ""
+        if rr == "" or rr.lower() == "nan":
+            continue
+        m |= rle_decode_one(rr, shape)
+    return m
+
+def freeze_bn_layers(model: nn.Module) -> None:
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad = False
+
+def set_train_mode_with_frozen_bn(model: nn.Module) -> None:
+    model.train()
+    if FREEZE_BN:
+        freeze_bn_layers(model)
+
+def stratified_split_train_val(
+    all_ids: List[str],
+    id_to_rles: Dict[str, List[str]],
+    seed: int,
+    train_frac: float
+) -> Tuple[List[str], List[str]]:
+    """
+    Split all_ids into train_ids / val_ids by stratifying pos/neg:
+      pos := has any RLEs
+      neg := empty
+    """
+    rnd = random.Random(seed)
+    pos = [i for i in all_ids if len(id_to_rles.get(i, [])) > 0]
+    neg = [i for i in all_ids if len(id_to_rles.get(i, [])) == 0]
+    rnd.shuffle(pos); rnd.shuffle(neg)
+
+    def split(lst: List[str]) -> Tuple[List[str], List[str]]:
+        n = len(lst)
+        n_tr = int(round(n * train_frac))
+        tr = lst[:n_tr]
+        va = lst[n_tr:]
+        return tr, va
+
+    p_tr, p_va = split(pos)
+    n_tr, n_va = split(neg)
+
+    train_ids = p_tr + n_tr
+    val_ids = p_va + n_va
+    rnd.shuffle(train_ids)
+    rnd.shuffle(val_ids)
+    return train_ids, val_ids
+
+def split_val_into_three(val_ids: List[str], seed: int) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Pure 3-way split of val_ids (disjoint), no caps:
+      val_seg, val_tree_train, val_tree_calib
+    """
+    rnd = random.Random(seed)
+    vv = val_ids[:]
+    rnd.shuffle(vv)
+    n = len(vv)
+    a = n // 3
+    b = n // 3
+    c = n - a - b
+    val_seg = vv[:a]
+    val_tree_train = vv[a:a+b]
+    val_tree_calib = vv[a+b:]
+    assert len(val_seg) + len(val_tree_train) + len(val_tree_calib) == n
+    return val_seg, val_tree_train, val_tree_calib
+
+
+# =========================
+# Dataset (robust)
+# =========================
+class ShipDataset(Dataset):
+    def __init__(
+        self,
+        ids: List[str],
+        id_to_rles: Dict[str, List[str]],
+        img_dir: str,
+        size: int,
+        return_mask: bool,
+        bad_log_path: str,
+        strict_order: bool = False,
+    ):
+        self.ids = ids
+        self.id_to_rles = id_to_rles
+        self.img_dir = img_dir
+        self.size = size
+        self.return_mask = return_mask
+        self.bad_log_path = bad_log_path
+        self.strict_order = strict_order
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def _log_bad(self, img_path: str) -> None:
+        try:
+            with open(self.bad_log_path, "a", encoding="utf-8") as f:
+                f.write(img_path + "\n")
+        except Exception:
+            pass
+
+    def _load_x(self, img_id: str) -> Optional[torch.Tensor]:
+        p = os.path.join(self.img_dir, img_id)
+        x = safe_read_image_rgb(p)
+        if x is None:
+            self._log_bad(p)
+            return None
+        if x.shape[1] != self.size or x.shape[2] != self.size:
+            x = x.unsqueeze(0)
+            x = F.interpolate(x, size=(self.size, self.size), mode="bilinear", align_corners=False)
+            x = x[0]
+        return x
+
+    def _load_y(self, img_id: str) -> torch.Tensor:
+        rles = self.id_to_rles.get(img_id, [])
+        m = rle_decode_many(rles, (768, 768))
+        mt = torch.from_numpy(m).unsqueeze(0).unsqueeze(0).float()
+        if self.size != 768:
+            mt = F.interpolate(mt, size=(self.size, self.size), mode="nearest")
+        y = (mt[0, 0] > 0.5).float()
+        return y
+
+    def __getitem__(self, idx: int):
+        # strict_order=False for GT datasets: skip unreadable by shifting
+        if self.strict_order:
+            img_id = self.ids[idx]
+            x = self._load_x(img_id)
+            if x is None:
+                x = torch.zeros(3, self.size, self.size, dtype=torch.float32)
+            if not self.return_mask:
+                return x, img_id
+            y = self._load_y(img_id)
+            return x, y, img_id
+
+        for k in range(MAX_SKIP_TRIES):
+            j = (idx + k) % len(self.ids)
+            img_id = self.ids[j]
+            x = self._load_x(img_id)
+            if x is None:
+                continue
+            if not self.return_mask:
+                return x, img_id
+            y = self._load_y(img_id)
+            return x, y, img_id
+
+        # fallback
+        img_id = self.ids[idx]
+        x = torch.zeros(3, self.size, self.size, dtype=torch.float32)
+        if not self.return_mask:
+            return x, img_id
+        y = self._load_y(img_id)
+        return x, y, img_id
+
+
+# =========================
+# DeepLabv3+ (BN-safe)
+# =========================
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_ch, out_ch, k, s=1, p=0, d=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.act = nn.ReLU(inplace=True)
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+class ConvReLU(nn.Module):
+    def __init__(self, in_ch, out_ch, k, s=1, p=0, d=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, dilation=d, bias=False)
+        self.act = nn.ReLU(inplace=True)
+    def forward(self, x):
+        return self.act(self.conv(x))
+
+class ASPP(nn.Module):
+    def __init__(self, in_ch, out_ch=256, rates=(6, 12, 18)):
+        super().__init__()
+        self.b0 = ConvBNReLU(in_ch, out_ch, 1)
+        self.b1 = ConvBNReLU(in_ch, out_ch, 3, p=rates[0], d=rates[0])
+        self.b2 = ConvBNReLU(in_ch, out_ch, 3, p=rates[1], d=rates[1])
+        self.b3 = ConvBNReLU(in_ch, out_ch, 3, p=rates[2], d=rates[2])
+
+        # pool branch -> 1x1 features; BN can be unstable => no BN here
+        self.pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            ConvReLU(in_ch, out_ch, 1)
+        )
+        self.proj = nn.Sequential(ConvBNReLU(out_ch * 5, out_ch, 1), nn.Dropout2d(0.1))
+
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        p = self.pool(x)
+        p = F.interpolate(p, size=(h, w), mode="bilinear", align_corners=False)
+        y = torch.cat([self.b0(x), self.b1(x), self.b2(x), self.b3(x), p], dim=1)
+        return self.proj(y)
+
+class DeepLabV3Plus(nn.Module):
+    def __init__(self):
+        super().__init__()
+        backbone = torchvision.models.resnet50(weights=None)
+        self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+
+        self.aspp = ASPP(2048, 256)
+        self.low_reduce = ConvBNReLU(256, 48, 1)
+        self.dec1 = ConvBNReLU(256 + 48, 256, 3, p=1)
+        self.dec2 = ConvBNReLU(256, 256, 3, p=1)
+        self.head = nn.Conv2d(256, 1, 1)
+
+    def forward(self, x):
+        ih, iw = x.shape[-2:]
+        x = self.stem(x)
+        low = self.layer1(x)
+        x = self.layer2(low)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.aspp(x)
+        x = F.interpolate(x, size=low.shape[-2:], mode="bilinear", align_corners=False)
+        low2 = self.low_reduce(low)
+        x = torch.cat([x, low2], dim=1)
+        x = self.dec1(x)
+        x = self.dec2(x)
+        x = self.head(x)
+        x = F.interpolate(x, size=(ih, iw), mode="bilinear", align_corners=False)
+        return x
+
+
+# =========================
+# Loss (BCE + Tversky)
+# =========================
+class TverskyLoss(nn.Module):
+    def __init__(self, alpha=0.4, beta=0.6, eps=1e-7):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.eps = eps
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        if targets.dim() == 3:
+            targets = targets.unsqueeze(1)
+        targets = targets.float()
+        tp = (probs * targets).sum(dim=(2, 3))
+        fp = (probs * (1 - targets)).sum(dim=(2, 3))
+        fn = ((1 - probs) * targets).sum(dim=(2, 3))
+        tv = (tp + self.eps) / (tp + self.alpha * fp + self.beta * fn + self.eps)
+        return (1.0 - tv).mean()
+
+
+# =========================
+# Metrics (pixel-proxy F2)
+# =========================
+def confusion(pred: torch.Tensor, gt: torch.Tensor) -> Tuple[int, int, int]:
+    pred = pred.to(torch.int32)
+    gt = gt.to(torch.int32)
+    tp = int(((pred == 1) & (gt == 1)).sum().item())
+    fp = int(((pred == 1) & (gt == 0)).sum().item())
+    fn = int(((pred == 0) & (gt == 1)).sum().item())
+    return tp, fp, fn
+
+def f2_from_counts(tp: int, fp: int, fn: int, eps=1e-9) -> float:
+    p = tp / (tp + fp + eps)
+    r = tp / (tp + fn + eps)
+    b2 = 4.0
+    return float((1 + b2) * p * r / (b2 * p + r + eps))
+
+@torch.no_grad()
+def eval_f2(model, loader, device, thr: float) -> float:
+    model.eval()
+    tp = fp = fn = 0
+    for x, y, _ in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        prob = torch.sigmoid(model(x))[:, 0]
+        pred = (prob >= thr).float()
+        tpi, fpi, fni = confusion(pred.cpu(), y.cpu())
+        tp += tpi; fp += fpi; fn += fni
+    return f2_from_counts(tp, fp, fn)
+
+@torch.no_grad()
+def tune_thr(model, loader, device) -> Tuple[float, float]:
+    best_thr = 0.5
+    best = -1.0
+    for t in THR_GRID:
+        f2 = eval_f2(model, loader, device, t)
+        if f2 > best:
+            best = f2
+            best_thr = t
+    return best_thr, float(best)
+
+
+# =========================
+# Connected components + features
+# =========================
+def connected_components(mask_bin: np.ndarray):
+    if CC_BACKEND == "cv2":
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask_bin, connectivity=8)
+        comps = []
+        for i in range(1, num):
+            x, y, w, h, area = stats[i].tolist()
+            comps.append((i, x, y, w, h, area))
+        return labels, comps
+    if CC_BACKEND == "scipy":
+        labels, num = ndi.label(mask_bin)
+        comps = []
+        for i in range(1, num + 1):
+            ys, xs = np.where(labels == i)
+            if ys.size == 0:
+                continue
+            y0, y1 = int(ys.min()), int(ys.max())
+            x0, x1 = int(xs.min()), int(xs.max())
+            w = x1 - x0 + 1
+            h = y1 - y0 + 1
+            area = int(ys.size)
+            comps.append((i, x0, y0, w, h, area))
+        return labels, comps
+    raise RuntimeError("Need opencv-python or scipy for connected components.")
+
+def comp_features(labels: np.ndarray, comps, prob: np.ndarray, gt: Optional[np.ndarray]):
+    feats = []
+    ys = [] if gt is not None else None
+    kept = []
+    H, W = prob.shape
+    for (lab, x, y, w, h, area) in comps:
+        if area < MIN_COMP_AREA:
+            continue
+        roi_lab = labels[y:y+h, x:x+w]
+        m = (roi_lab == lab)
+        if m.sum() == 0:
+            continue
+        roi_prob = prob[y:y+h, x:x+w]
+        mean_p = float(roi_prob[m].mean())
+        max_p = float(roi_prob[m].max())
+        bbox_area = float(w * h)
+        fill = float(area / (bbox_area + 1e-9))
+        area_frac = float(area / (H * W + 1e-9))
+        feats.append([float(area), area_frac, float(w), float(h), fill, mean_p, max_p])
+        kept.append((lab, x, y, w, h, area))
+        if gt is not None:
+            roi_gt = gt[y:y+h, x:x+w]
+            inter = int((roi_gt[m] > 0).sum())
+            overlap = inter / (int(m.sum()) + 1e-9)
+            ys.append(1 if overlap >= COMP_POS_OVERLAP else 0)
+    X = np.asarray(feats, dtype=np.float32) if feats else np.zeros((0, 7), dtype=np.float32)
+    y = np.asarray(ys, dtype=np.int64) if ys is not None else None
+    return X, y, kept
+
+def apply_tree(labels: np.ndarray, comps, prob: np.ndarray, tree, tree_thr: float) -> np.ndarray:
+    X, _, kept = comp_features(labels, comps, prob, gt=None)
+    if X.shape[0] == 0:
+        return np.zeros(prob.shape, dtype=np.uint8)
+    proba = tree.predict_proba(X)[:, 1]
+    out = np.zeros(prob.shape, dtype=np.uint8)
+    for i, p in enumerate(proba):
+        if p < tree_thr:
+            continue
+        lab, x, y, w, h, _ = kept[i]
+        roi = labels[y:y+h, x:x+w]
+        m = (roi == lab)
+        out[y:y+h, x:x+w][m] = 1
+    return out
+
+
+# =========================
+# Visualization helpers
+# =========================
+def save_hist(values: np.ndarray, out_path: str, title: str, xlabel: str) -> None:
+    plt.figure()
+    plt.hist(values, bins=60)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel("count")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+def save_perm_importance(tree, X: np.ndarray, y: np.ndarray, feat_names: List[str], out_path: str, seed: int) -> Dict[str, float]:
+    """
+    HistGradientBoosting has no feature_importances_. Use permutation importance.
+    For efficiency, sample if too large (visualization only).
+    """
+    rnd = np.random.RandomState(seed)
+    n = X.shape[0]
+    idx = np.arange(n)
+    if n > 20000:
+        idx = rnd.choice(idx, size=20000, replace=False)
+        Xs = X[idx]
+        ys = y[idx]
+    else:
+        Xs = X
+        ys = y
+
+    r = permutation_importance(tree, Xs, ys, n_repeats=5, random_state=seed, scoring="f1")
+    importances = r.importances_mean
+    order = np.argsort(importances)[::-1]
+
+    plt.figure()
+    plt.bar(range(len(importances)), importances[order])
+    plt.xticks(range(len(importances)), [feat_names[i] for i in order], rotation=30, ha="right")
+    plt.title("Permutation Importance (F1, sampled if large)")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+
+    return {feat_names[i]: float(importances[i]) for i in range(len(importances))}
+
+
+# =========================
+# Main
+# =========================
+def main():
+    set_seed(SEED)
+    if CC_BACKEND is None:
+        raise RuntimeError("connected components backend missing: install opencv-python or scipy in this container.")
+
+    ensure_dir(OUT_ROOT)
+    out_dir = os.path.join(OUT_ROOT, f"run__{now_tag()}__seed{SEED}")
+    ensure_dir(out_dir)
+    bad_log = os.path.join(out_dir, "bad_images.txt")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] device={device} torch={torch.__version__}")
+    if device.type == "cuda":
+        print(f"[INFO] gpu={torch.cuda.get_device_name(0)}")
+
+    # ----- read CSV -> id_to_rles (labels) -----
+    id_to_rles: Dict[str, List[str]] = {}
+    with open(TRAIN_CSV, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header is None:
+            raise RuntimeError("Empty train CSV")
+        for row in reader:
+            if not row:
+                continue
+            img_id = row[0]
+            rle = row[1] if len(row) > 1 else ""
+            id_to_rles.setdefault(img_id, [])
+            if rle is not None and rle != "" and str(rle).lower() != "nan":
+                id_to_rles[img_id].append(rle)
+
+    # ----- enumerate FULL population from train_v2 dir -----
+    all_ids = list_image_ids_from_dir(TRAIN_IMG_DIR)
+
+    # ensure missing csv ids are treated as negatives (already by default)
+    # but keep id_to_rles only for those in CSV; others => [] (neg)
+    print(f"[INFO] full population from dir: {len(all_ids)} images")
+    pos_cnt = sum(1 for i in all_ids if len(id_to_rles.get(i, [])) > 0)
+    neg_cnt = len(all_ids) - pos_cnt
+    print(f"[INFO] label view from CSV: pos={pos_cnt} neg={neg_cnt}")
+
+    # ----- split train/val (85/15) stratified -----
+    train_ids, val_ids = stratified_split_train_val(all_ids, id_to_rles, seed=SEED, train_frac=TRAIN_FRAC)
+    print(f"[INFO] split train={len(train_ids)} val={len(val_ids)} (train_frac={TRAIN_FRAC})")
+
+    # ----- split val into 3 disjoint parts -----
+    val_seg_ids, val_tree_train_ids, val_tree_calib_ids = split_val_into_three(val_ids, seed=SEED)
+    print(f"[INFO] val split 3-way: val_seg={len(val_seg_ids)} tree_train={len(val_tree_train_ids)} tree_calib={len(val_tree_calib_ids)}")
+
+    with open(os.path.join(out_dir, "split_ids.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "train": train_ids,
+                "val_seg": val_seg_ids,
+                "val_tree_train": val_tree_train_ids,
+                "val_tree_calib": val_tree_calib_ids,
+            },
+            f,
+        )
+
+    # ----- dataloaders -----
+    cpu = os.cpu_count() or 8
+    nw = max(2, min(8, cpu // 2))
+    print(f"[INFO] num_workers={nw}")
+
+    def make_loader(ds, bs, shuffle, drop_last=False):
+        kwargs = dict(
+            batch_size=bs,
+            shuffle=shuffle,
+            num_workers=nw,
+            pin_memory=(device.type == "cuda"),
+            drop_last=drop_last,
+        )
+        if nw > 0 and PERSISTENT_WORKERS:
+            kwargs["persistent_workers"] = True
+            kwargs["prefetch_factor"] = 2
+        return DataLoader(ds, **kwargs)
+
+    ds_tr = ShipDataset(train_ids, id_to_rles, TRAIN_IMG_DIR, TRAIN_SIZE, True, bad_log, strict_order=False)
+    ds_va = ShipDataset(val_seg_ids, id_to_rles, TRAIN_IMG_DIR, TRAIN_SIZE, True, bad_log, strict_order=False)
+
+    tr_loader = make_loader(ds_tr, BATCH_TRAIN, shuffle=True,  drop_last=True)   # BN safety
+    va_loader = make_loader(ds_va, BATCH_EVAL,  shuffle=False, drop_last=False)
+
+    # ----- model + losses -----
+    model = DeepLabV3Plus().to(device)
+    bce = nn.BCEWithLogitsLoss()
+    tv  = TverskyLoss(alpha=TV_ALPHA, beta=TV_BETA)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    if _AMP_NEW:
+        scaler = GradScaler("cuda", enabled=(device.type == "cuda" and AMP_ENABLE))
+    else:
+        scaler = GradScaler(enabled=(device.type == "cuda" and AMP_ENABLE))
+
+    best_path = os.path.join(out_dir, "best_model.pth")
+    best_f2 = -1.0
+    best_thr = 0.5
+    best_epoch = -1
+    no_imp = 0
+
+    # ----- training loop (no internal test) -----
+    for epoch in range(1, MAX_EPOCHS + 1):
+        t0 = time.time()
+        set_train_mode_with_frozen_bn(model)
+
+        loss_sum = 0.0
+        steps = 0
+
+        for x, y, _ in tr_loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            opt.zero_grad(set_to_none=True)
+
+            if _AMP_NEW:
+                with autocast("cuda", enabled=(device.type == "cuda" and AMP_ENABLE)):
+                    logits = model(x)
+                    loss = bce(logits[:, 0], y) + tv(logits, y)
+            else:
+                with autocast(enabled=(device.type == "cuda" and AMP_ENABLE)):
+                    logits = model(x)
+                    loss = bce(logits[:, 0], y) + tv(logits, y)
+
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+            loss_sum += float(loss.item())
+            steps += 1
+
+        # validate on val_seg only
+        thr, f2 = tune_thr(model, va_loader, device)
+        dt = time.time() - t0
+        tr_loss = loss_sum / max(steps, 1)
+        print(f"[E{epoch:03d}] time={dt:.1f}s train_loss={tr_loss:.4f} valF2={f2:.4f} best_thr@val={thr:.2f}")
+
+        if f2 > best_f2 + 1e-6:
+            best_f2 = f2
+            best_thr = thr
+            best_epoch = epoch
+            no_imp = 0
+            torch.save(
+                {"model": model.state_dict(), "epoch": epoch, "best_f2": best_f2, "best_thr": best_thr},
+                best_path
+            )
+            print(f"[SAVE] best_model updated: epoch={epoch} best_f2={best_f2:.4f} thr={best_thr:.2f}")
+        else:
+            no_imp += 1
+
+        if epoch >= MIN_EPOCHS_BEFORE_STOP and no_imp >= EARLY_PATIENCE:
+            print("[EARLY STOP]")
+            break
+
+    ckpt = torch.load(best_path, map_location="cpu")
+    model.load_state_dict(ckpt["model"])
+    best_thr = float(ckpt.get("best_thr", best_thr))
+    best_f2 = float(ckpt.get("best_f2", best_f2))
+    best_epoch = int(ckpt.get("epoch", best_epoch))
+    print(f"[INFO] best_epoch={best_epoch} best_thr={best_thr:.2f} best_valF2={best_f2:.4f}")
+
+    # ----- seg prob histogram on val_seg (for calibration feel) -----
+    model.eval()
+    seg_probs = []
+    with torch.no_grad():
+        for x, y, _ in va_loader:
+            x = x.to(device, non_blocking=True)
+            prob = torch.sigmoid(model(x))[:, 0].detach().cpu().numpy().astype(np.float32)
+            seg_probs.append(prob.reshape(-1))
+    seg_probs = np.concatenate(seg_probs, axis=0)
+    save_hist(seg_probs, os.path.join(out_dir, "seg_prob_hist.png"), "Segmentation Probabilities (val_seg)", "p(ship)")
+
+    # =========================
+    # TREE STAGE
+    # =========================
+    ds_tree_tr = ShipDataset(val_tree_train_ids, id_to_rles, TRAIN_IMG_DIR, INFER_SIZE, True, bad_log, strict_order=False)
+    ds_tree_ca = ShipDataset(val_tree_calib_ids, id_to_rles, TRAIN_IMG_DIR, INFER_SIZE, True, bad_log, strict_order=False)
+    dl_tree_tr = make_loader(ds_tree_tr, BATCH_TREE, shuffle=False, drop_last=False)
+    dl_tree_ca = make_loader(ds_tree_ca, BATCH_TREE, shuffle=False, drop_last=False)
+
+    # build component dataset from val_tree_train
+    Xs, Ys = [], []
+    with torch.no_grad():
+        for x, y, _ in dl_tree_tr:
+            x = x.to(device, non_blocking=True)
+            gt = y.cpu().numpy().astype(np.uint8)
+            prob = torch.sigmoid(model(x))[:, 0].detach().cpu().numpy().astype(np.float32)
+            for i in range(prob.shape[0]):
+                pm = prob[i]
+                g = gt[i]
+                pred_bin = (pm >= best_thr).astype(np.uint8)
+                labels, comps = connected_components(pred_bin)
+                X, yy, _ = comp_features(labels, comps, pm, gt=g)
+                if X.shape[0] > 0 and yy is not None:
+                    Xs.append(X); Ys.append(yy)
+
+    if not Xs:
+        raise RuntimeError("TREE: no components found; check threshold/model outputs.")
+    Xtr = np.concatenate(Xs, axis=0)
+    ytr = np.concatenate(Ys, axis=0)
+    pos = int((ytr == 1).sum()); neg = int((ytr == 0).sum())
+    print(f"[TREE] comp samples={len(ytr)} pos={pos} neg={neg}")
+    if pos == 0:
+        raise RuntimeError("TREE: pos=0; cannot train component classifier.")
+
+    # class weighting
+    w_pos = neg / max(pos, 1)
+    sw = np.where(ytr == 1, w_pos, 1.0).astype(np.float32)
+
+    tree = HistGradientBoostingClassifier(
+        max_iter=200, learning_rate=0.08, max_depth=5, random_state=SEED
+    )
+    tree.fit(Xtr, ytr, sample_weight=sw)
+
+    # tune tree_thr on val_tree_calib (pixel F2 proxy)
+    cand = [0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
+    best_tt = 0.5
+    best_f2t = -1.0
+
+    # cache calib probs to avoid recompute
+    cache = []
+    with torch.no_grad():
+        for x, y, _ in dl_tree_ca:
+            x = x.to(device, non_blocking=True)
+            gt = y.cpu().numpy().astype(np.uint8)
+            prob = torch.sigmoid(model(x))[:, 0].detach().cpu().numpy().astype(np.float32)
+            cache.append((prob, gt))
+
+    for tt in cand:
+        tp = fp = fn = 0
+        for prob, gt in cache:
+            for i in range(prob.shape[0]):
+                pm = prob[i]
+                g = gt[i]
+                pred_bin = (pm >= best_thr).astype(np.uint8)
+                labels, comps = connected_components(pred_bin)
+                if len(comps) == 0:
+                    pred2 = np.zeros_like(pred_bin, dtype=np.uint8)
+                else:
+                    pred2 = apply_tree(labels, comps, pm, tree, tt)
+
+                p_t = torch.from_numpy(pred2.astype(np.uint8))
+                g_t = torch.from_numpy((g > 0).astype(np.uint8))
+                tpi, fpi, fni = confusion(p_t, g_t)
+                tp += tpi; fp += fpi; fn += fni
+
+        f2t = f2_from_counts(tp, fp, fn)
+        if f2t > best_f2t:
+            best_f2t = f2t
+            best_tt = tt
+
+    tree_thr = float(best_tt)
+    print(f"[TREE] best_tree_thr={tree_thr:.2f} calib_F2proxy={best_f2t:.4f}")
+
+    # save tree model
+    tree_path = os.path.join(out_dir, "tree_model.joblib")
+    joblib.dump(tree, tree_path)
+
+    # tree prob hist + permutation importance
+    # Build a calibration component dataset (Xc, yc) from val_tree_calib for visualization/importance
+    Xc_list, yc_list = [], []
+    tree_probs = []
+    with torch.no_grad():
+        for prob, gt in cache:
+            for i in range(prob.shape[0]):
+                pm = prob[i]
+                g = gt[i]
+                pred_bin = (pm >= best_thr).astype(np.uint8)
+                labels, comps = connected_components(pred_bin)
+                Xc, yc, _ = comp_features(labels, comps, pm, gt=g)
+                if Xc.shape[0] == 0 or yc is None:
+                    continue
+                Xc_list.append(Xc)
+                yc_list.append(yc)
+                tree_probs.append(tree.predict_proba(Xc)[:, 1])
+
+    if Xc_list:
+        Xc = np.concatenate(Xc_list, axis=0)
+        yc = np.concatenate(yc_list, axis=0)
+        tree_probs = np.concatenate(tree_probs, axis=0).astype(np.float32)
+        save_hist(tree_probs, os.path.join(out_dir, "tree_prob_hist.png"), "Tree Probabilities (val_tree_calib components)", "p(component=ship)")
+        feat_names = ["area", "area_frac", "w", "h", "fill", "mean_p", "max_p"]
+        imp = save_perm_importance(tree, Xc, yc, feat_names, os.path.join(out_dir, "tree_perm_importance.png"), seed=SEED)
+    else:
+        Xc = np.zeros((0, 7), dtype=np.float32)
+        yc = np.zeros((0,), dtype=np.int64)
+        imp = {}
+
+    # save meta
+    meta = {
+        "DATA_DIR": DATA_DIR,
+        "TRAIN_IMG_DIR": TRAIN_IMG_DIR,
+        "TRAIN_CSV": TRAIN_CSV,
+        "SEED": SEED,
+        "TRAIN_FRAC": TRAIN_FRAC,
+        "TRAIN_SIZE": TRAIN_SIZE,
+        "INFER_SIZE": INFER_SIZE,
+        "BATCH_TRAIN": BATCH_TRAIN,
+        "BATCH_EVAL": BATCH_EVAL,
+        "BATCH_TREE": BATCH_TREE,
+        "MAX_EPOCHS": MAX_EPOCHS,
+        "EARLY_PATIENCE": EARLY_PATIENCE,
+        "MIN_EPOCHS_BEFORE_STOP": MIN_EPOCHS_BEFORE_STOP,
+        "FREEZE_BN": FREEZE_BN,
+        "AMP_ENABLE": AMP_ENABLE,
+        "AMP_NEW_API": _AMP_NEW,
+        "CC_BACKEND": CC_BACKEND,
+        "best_epoch": best_epoch,
+        "best_thr": best_thr,
+        "best_valF2_proxy": best_f2,
+        "tree_thr": tree_thr,
+        "tree_calib_F2_proxy": best_f2t,
+        "tree_model_path": tree_path,
+        "tree_perm_importance": imp,
+        "counts": {
+            "all_ids": len(all_ids),
+            "pos_ids": int(pos_cnt),
+            "neg_ids": int(neg_cnt),
+            "train_ids": len(train_ids),
+            "val_ids": len(val_ids),
+            "val_seg_ids": len(val_seg_ids),
+            "val_tree_train_ids": len(val_tree_train_ids),
+            "val_tree_calib_ids": len(val_tree_calib_ids),
+            "tree_train_components": int(len(ytr)),
+            "tree_train_pos": int(pos),
+            "tree_train_neg": int(neg),
+            "tree_calib_components": int(Xc.shape[0]),
+        },
+        "out_dir": out_dir,
+        "best_model_path": best_path,
+        "plots": {
+            "seg_prob_hist": os.path.join(out_dir, "seg_prob_hist.png"),
+            "tree_prob_hist": os.path.join(out_dir, "tree_prob_hist.png"),
+            "tree_perm_importance": os.path.join(out_dir, "tree_perm_importance.png"),
+        },
+    }
+
+    with open(os.path.join(out_dir, "tree_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    print("[DONE]")
+    print(json.dumps(meta, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
