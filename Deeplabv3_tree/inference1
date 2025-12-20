@@ -1,0 +1,1221 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ship_optthr_infer_submit.py
+
+目的:
+  既存RUN_DIRの best_model.pth を読み込み、
+  1) seg閾値(best_thr)をval_segで最適化（pixel Fβ）
+  2) segのproposal(comp)を作り、component特徴量でtree学習
+  3) tree閾値(tree_thr)をval_tree_calibで最適化（component Fβ）
+  4) test_v2 を推論し、インスタンスごとにRLE出力して submission.csv を生成
+
+重要:
+  - 「ファイル先頭に説明文が混ざってSyntaxError」問題を避けるため、
+    このファイルは必ずこのまま保存してください（先頭が shebang で始まる）。
+  - AMP(autocast)は使いません（FP32運用）。
+  - OOM/Killed 対策として「確率マップや巨大配列を溜め込まない」作りにしています。
+    (pixel閾値最適化はヒストグラム集計 / tree特徴量はcomponent単位のみ保持)
+
+依存:
+  pip install numpy pillow scikit-learn joblib
+  (cv2があると高速。無い場合はscipyが必要: pip install scipy)
+
+実行例:
+  python3 ship_optthr_infer_submit.py \
+    --run_dir /workspace/kaggle_competition/outputs_airbus/run__20251219_053138__seed42 \
+    --data_dir /workspace/kaggle_competition/airbus-ship-detection \
+    --infer_size 768 \
+    --batch_eval 4 --batch_tree 4 --batch_test 2 \
+    --num_workers 4
+"""
+
+import os
+import sys
+import csv
+import json
+import math
+import time
+import random
+import logging
+import argparse
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+from torchvision.transforms import functional as TVF
+
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+import joblib
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.metrics import precision_recall_fscore_support
+
+# -------------------------
+# Optional: cv2 for CC
+# -------------------------
+CC_BACKEND = None
+try:
+    import cv2  # type: ignore
+    CC_BACKEND = "cv2"
+except Exception:
+    CC_BACKEND = None
+    try:
+        from scipy import ndimage as ndi  # type: ignore
+    except Exception:
+        ndi = None
+
+
+# -------------------------
+# Utils
+# -------------------------
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def now_str() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def safe_load_image_rgb(path: str) -> Image.Image:
+    img = Image.open(path).convert("RGB")
+    return img
+
+
+def normalize_img_tensor(x: torch.Tensor) -> torch.Tensor:
+    # x: float [0,1], shape (3,H,W)
+    mean = IMAGENET_MEAN.to(device=x.device, dtype=x.dtype)
+    std = IMAGENET_STD.to(device=x.device, dtype=x.dtype)
+    return (x - mean) / std
+
+
+def rle_decode(rle_str: str, shape: Tuple[int, int] = (768, 768)) -> np.ndarray:
+    """
+    Kaggle Airbus RLE:
+      - 1-indexed starts
+      - run lengths
+      - flatten in column-major (Fortran order)
+    Returns: uint8 mask (H,W) values {0,1}
+    """
+    if rle_str is None or rle_str == "":
+        return np.zeros(shape, dtype=np.uint8)
+    s = rle_str.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    img = np.zeros(shape[0] * shape[1], dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        img[lo:hi] = 1
+    # reshape Fortran
+    return img.reshape((shape[1], shape[0]), order="F").T  # (H,W)
+
+
+def rle_encode(mask: np.ndarray) -> str:
+    """
+    mask: uint8/bool (H,W) {0,1}
+    Kaggle expects Fortran order flatten.
+    Returns "" if no positive.
+    """
+    if mask is None:
+        return ""
+    m = mask.astype(np.uint8)
+    if m.max() == 0:
+        return ""
+    # Flatten in Fortran order
+    pixels = m.T.flatten(order="F")  # (W,H) then flatten -> correct convention
+    # Pad zeros at both ends
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+
+def read_train_csv_id2rles(train_csv: str) -> Dict[str, List[str]]:
+    """
+    train_ship_segmentations_v2.csv:
+      ImageId, EncodedPixels
+    ship-negative images do not appear with empty line; rather only appear once with empty? (varies)
+    Safer: collect only non-empty RLE lines as positives; absent -> negative.
+    """
+    id2rles: Dict[str, List[str]] = {}
+    with open(train_csv, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            img_id = row["ImageId"]
+            rle = row.get("EncodedPixels", "")
+            if rle is None:
+                rle = ""
+            rle = rle.strip()
+            if img_id not in id2rles:
+                id2rles[img_id] = []
+            if rle != "":
+                id2rles[img_id].append(rle)
+    return id2rles
+
+
+def union_mask_from_rles(rles: List[str], shape=(768, 768)) -> np.ndarray:
+    if not rles:
+        return np.zeros(shape, dtype=np.uint8)
+    m = np.zeros(shape, dtype=np.uint8)
+    for r in rles:
+        m |= rle_decode(r, shape=shape)
+    return m
+
+
+def softmax_ship_prob(logits: torch.Tensor) -> torch.Tensor:
+    """
+    logits: (N,2,H,W) -> prob of class=1 ship
+    """
+    probs = torch.softmax(logits, dim=1)[:, 1]
+    return probs
+
+
+def auto_detect_deeplab_variant_from_state_dict_keys(keys: List[str]) -> str:
+    """
+    Detect resnet50 vs resnet101 by existence of layer3.22.* (resnet101 has 23 blocks in layer3).
+    """
+    for k in keys:
+        if ".backbone.body.layer3.22." in k or "backbone.body.layer3.22." in k:
+            return "deeplabv3_resnet101"
+    return "deeplabv3_resnet50"
+
+
+def build_deeplab(seg_model: str, num_classes: int = 2) -> torch.nn.Module:
+    name = seg_model.lower().strip()
+    if name == "deeplabv3_resnet50":
+        return torchvision.models.segmentation.deeplabv3_resnet50(
+            weights=None, weights_backbone=None, num_classes=num_classes
+        )
+    if name == "deeplabv3_resnet101":
+        return torchvision.models.segmentation.deeplabv3_resnet101(
+            weights=None, weights_backbone=None, num_classes=num_classes
+        )
+    raise ValueError(f"Unknown seg_model={seg_model}")
+
+
+def load_best_model(ckpt_path: str, device: torch.device, seg_model_hint: str = "auto") -> Tuple[torch.nn.Module, str]:
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+
+    if not isinstance(sd, dict):
+        raise RuntimeError("Checkpoint format unexpected (not a state_dict dict).")
+
+    keys = list(sd.keys())
+    if seg_model_hint == "auto":
+        seg_model = auto_detect_deeplab_variant_from_state_dict_keys(keys)
+    else:
+        seg_model = seg_model_hint
+
+    model = build_deeplab(seg_model, num_classes=2)
+
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    # strict=False で通しつつ、ログに残す（head違い等の見逃し防止）
+    if missing:
+        logging.warning(f"[CKPT] missing keys: {len(missing)} (show first 20) {missing[:20]}")
+    if unexpected:
+        logging.warning(f"[CKPT] unexpected keys: {len(unexpected)} (show first 20) {unexpected[:20]}")
+
+    model.to(device)
+    model.eval()
+    return model, seg_model
+
+
+# -------------------------
+# Datasets for VAL (train images with GT from RLE)
+# -------------------------
+class AirbusValDataset(Dataset):
+    def __init__(
+        self,
+        img_dir: str,
+        ids: List[str],
+        id2rles: Dict[str, List[str]],
+        size: int = 768,
+    ):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.id2rles = id2rles
+        self.size = int(size)
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        img_id = self.ids[idx]
+        img_path = os.path.join(self.img_dir, img_id)
+        img = safe_load_image_rgb(img_path)
+        if self.size != 768:
+            img = img.resize((self.size, self.size), resample=Image.BILINEAR)
+        x = TVF.to_tensor(img)  # float [0,1], (3,H,W)
+        x = normalize_img_tensor(x)
+
+        # GT mask from RLE (union) and resize with NEAREST if needed
+        rles = self.id2rles.get(img_id, [])
+        m = union_mask_from_rles(rles, shape=(768, 768))
+        if self.size != 768:
+            m_img = Image.fromarray((m * 255).astype(np.uint8))
+            m_img = m_img.resize((self.size, self.size), resample=Image.NEAREST)
+            m = (np.array(m_img) > 127).astype(np.uint8)
+        y = torch.from_numpy(m).long()  # (H,W) in {0,1}
+
+        return {"image_id": img_id, "pixel_values": x, "labels": y}
+
+
+# -------------------------
+# Component extraction + features
+# -------------------------
+@dataclass
+class Comp:
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    area: int
+    comp_mask: np.ndarray  # uint8 (H,W) 0/1
+
+
+def connected_components_from_binary(mask: np.ndarray) -> List[Comp]:
+    """
+    mask: uint8 {0,1} (H,W)
+    returns list of Comp with bbox + area + comp_mask
+    """
+    H, W = mask.shape
+    if mask.max() == 0:
+        return []
+
+    comps: List[Comp] = []
+
+    if CC_BACKEND == "cv2":
+        num, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+        # stats: [label, x, y, w, h, area]
+        for i in range(1, num):
+            x, y, w, h, area = stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3], stats[i, 4]
+            if area <= 0:
+                continue
+            x0, y0 = int(x), int(y)
+            x1, y1 = int(x + w), int(y + h)
+            comp_mask = (labels == i).astype(np.uint8)
+            comps.append(Comp(x0=x0, y0=y0, x1=x1, y1=y1, area=int(area), comp_mask=comp_mask))
+        return comps
+
+    # fallback: scipy
+    if ndi is None:
+        raise RuntimeError("cv2 not available and scipy not installed; cannot do connected components.")
+    lab, num = ndi.label(mask.astype(np.uint8))
+    for i in range(1, num + 1):
+        ys, xs = np.where(lab == i)
+        if ys.size == 0:
+            continue
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        comp_mask = (lab == i).astype(np.uint8)
+        area = int(comp_mask.sum())
+        comps.append(Comp(x0=x0, y0=y0, x1=x1, y1=y1, area=area, comp_mask=comp_mask))
+    return comps
+
+
+def comp_features(prob: np.ndarray, comp: Comp, base_thr: float) -> np.ndarray:
+    """
+    prob: float32 (H,W) in [0,1]
+    comp: component (mask/bbox)
+    returns small float32 feature vector
+    """
+    y0, y1 = comp.y0, comp.y1
+    x0, x1 = comp.x0, comp.x1
+    cm = comp.comp_mask[y0:y1, x0:x1].astype(bool)
+    p = prob[y0:y1, x0:x1][cm]
+    if p.size == 0:
+        # should not happen; safe
+        return np.zeros((12,), dtype=np.float32)
+
+    area = float(comp.area)
+    bw = float(x1 - x0)
+    bh = float(y1 - y0)
+    aspect = bw / (bh + 1e-6)
+
+    p_mean = float(p.mean())
+    p_max = float(p.max())
+    p_std = float(p.std())
+    frac_above = float((p >= base_thr).mean())
+
+    # bbox normalized
+    H, W = prob.shape
+    x0n = float(x0) / float(W)
+    y0n = float(y0) / float(H)
+    x1n = float(x1) / float(W)
+    y1n = float(y1) / float(H)
+
+    feats = np.array(
+        [area, bw, bh, aspect, p_mean, p_max, p_std, frac_above, x0n, y0n, x1n, y1n],
+        dtype=np.float32,
+    )
+    return feats
+
+
+def comp_label_from_overlap(comp: Comp, gt_mask: np.ndarray, overlap_thr: float = 0.25) -> int:
+    """
+    comp positive if overlap(comp_mask, gt) / area(comp) >= overlap_thr
+    """
+    inter = int((comp.comp_mask & gt_mask).sum())
+    if comp.area <= 0:
+        return 0
+    frac = inter / float(comp.area)
+    return 1 if frac >= overlap_thr else 0
+
+
+# -------------------------
+# Threshold tuning (seg) by histogram
+# -------------------------
+def tune_seg_threshold_hist(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    bins: int = 2000,
+    beta: float = 1.225,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Compute histograms of predicted prob for GT pos pixels and GT neg pixels.
+    Then derive precision/recall/Fbeta for thresholds at bin edges.
+    Memory-safe: does not store full prob maps.
+    """
+    pos_hist = torch.zeros((bins,), dtype=torch.float64)
+    neg_hist = torch.zeros((bins,), dtype=torch.float64)
+    total_pos = 0.0
+    total_neg = 0.0
+
+    t0 = time.time()
+    n_img = 0
+
+    with torch.inference_mode():
+        for batch in loader:
+            x = batch["pixel_values"].to(device, non_blocking=True)
+            y = batch["labels"].to(device, non_blocking=True)  # (N,H,W) 0/1
+            n_img += x.shape[0]
+
+            out = model(x)
+            logits = out["out"] if isinstance(out, dict) and "out" in out else out
+            if logits.shape[-2:] != y.shape[-2:]:
+                logits = F.interpolate(logits, size=y.shape[-2:], mode="bilinear", align_corners=False)
+
+            prob = softmax_ship_prob(logits)  # (N,H,W)
+
+            # flatten
+            prob_f = prob.reshape(-1).detach().cpu()
+            y_f = y.reshape(-1).detach().cpu()
+
+            pos = prob_f[y_f == 1]
+            neg = prob_f[y_f == 0]
+
+            if pos.numel() > 0:
+                h = torch.histc(pos, bins=bins, min=0.0, max=1.0).double()
+                pos_hist += h
+                total_pos += float(pos.numel())
+
+            if neg.numel() > 0:
+                h = torch.histc(neg, bins=bins, min=0.0, max=1.0).double()
+                neg_hist += h
+                total_neg += float(neg.numel())
+
+            # free
+            del x, y, out, logits, prob, prob_f, y_f, pos, neg
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    # cumulative sums from high to low threshold
+    # For threshold t at bin edge i: predicted positive counts are sum of hist bins >= i
+    pos_cum = torch.flip(torch.cumsum(torch.flip(pos_hist, dims=[0]), dim=0), dims=[0])
+    neg_cum = torch.flip(torch.cumsum(torch.flip(neg_hist, dims=[0]), dim=0), dims=[0])
+
+    best_f = -1.0
+    best_thr = 0.5
+    best_p = 0.0
+    best_r = 0.0
+
+    eps = 1e-12
+    beta2 = beta * beta
+
+    for i in range(bins):
+        tp = float(pos_cum[i])
+        fp = float(neg_cum[i])
+        fn = float(total_pos - tp)
+
+        p = tp / (tp + fp + eps)
+        r = tp / (tp + fn + eps)
+        f = (1 + beta2) * p * r / (beta2 * p + r + eps)
+
+        if f > best_f:
+            # threshold at bin left edge: i/bins
+            thr = float(i) / float(bins)
+            best_f = f
+            best_thr = thr
+            best_p = p
+            best_r = r
+
+    dt = time.time() - t0
+    info = {
+        "precision": float(best_p),
+        "recall": float(best_r),
+        "fbeta": float(best_f),
+        "beta": float(beta),
+        "n_images": float(n_img),
+        "seconds": float(dt),
+        "bins": float(bins),
+    }
+    return float(best_thr), info
+
+
+# -------------------------
+# Build tree dataset (streaming)
+# -------------------------
+def build_tree_dataset_from_loader(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    base_thr: float,
+    prop_mult: float,
+    overlap_thr: float,
+    min_area: int = 8,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+    """
+    For each image in loader:
+      - predict prob
+      - threshold at proposal_thr = base_thr * prop_mult (clamped)
+      - connected components -> features
+      - label by overlap with GT union mask
+    Returns:
+      X: float32 (M,D), y: int8 (M,)
+    """
+    X_list: List[np.ndarray] = []
+    y_list: List[int] = []
+    comps_total = 0
+
+    proposal_thr = float(np.clip(base_thr * prop_mult, 0.01, 0.999))
+
+    with torch.inference_mode():
+        for batch in loader:
+            x = batch["pixel_values"].to(device, non_blocking=True)
+            y = batch["labels"].cpu().numpy().astype(np.uint8)  # (N,H,W)
+            out = model(x)
+            logits = out["out"] if isinstance(out, dict) and "out" in out else out
+            if logits.shape[-2:] != batch["labels"].shape[-2:]:
+                logits = F.interpolate(logits, size=batch["labels"].shape[-2:], mode="bilinear", align_corners=False)
+            prob = softmax_ship_prob(logits).detach().cpu().numpy().astype(np.float32)  # (N,H,W)
+
+            N = prob.shape[0]
+            for i in range(N):
+                p = prob[i]
+                gt = y[i]
+                binmask = (p >= proposal_thr).astype(np.uint8)
+                comps = connected_components_from_binary(binmask)
+                for c in comps:
+                    if c.area < min_area:
+                        continue
+                    feats = comp_features(p, c, base_thr=base_thr)
+                    lab = comp_label_from_overlap(c, gt_mask=gt, overlap_thr=overlap_thr)
+                    X_list.append(feats)
+                    y_list.append(int(lab))
+                comps_total += len(comps)
+
+            del x, out, logits, prob
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    if len(X_list) == 0:
+        X = np.zeros((0, 12), dtype=np.float32)
+        y = np.zeros((0,), dtype=np.int8)
+    else:
+        X = np.stack(X_list, axis=0).astype(np.float32)
+        y = np.asarray(y_list, dtype=np.int8)
+
+    info = {
+        "proposal_thr": float(proposal_thr),
+        "prop_mult": float(prop_mult),
+        "overlap_thr": float(overlap_thr),
+        "min_area": float(min_area),
+        "comps_seen": float(comps_total),
+        "samples": float(X.shape[0]),
+        "pos": float(int(y.sum())) if y.size > 0 else 0.0,
+        "neg": float(int((y == 0).sum())) if y.size > 0 else 0.0,
+    }
+    return X, y, info
+
+
+def train_tree_model(
+    X: np.ndarray,
+    y: np.ndarray,
+    tree_model: str = "hgbdt",
+    seed: int = 42,
+) -> Tuple[object, Dict[str, float]]:
+    """
+    Tree model trains on component features. Keeps memory small.
+    """
+    if X.shape[0] == 0:
+        raise RuntimeError("Tree training set is empty. Increase proposal recall (lower prop_mult) or val set size.")
+    if tree_model == "hgbdt":
+        clf = HistGradientBoostingClassifier(
+            max_depth=6,
+            learning_rate=0.08,
+            max_iter=200,
+            random_state=seed,
+        )
+    elif tree_model == "rf":
+        clf = RandomForestClassifier(
+            n_estimators=400,
+            max_depth=14,
+            random_state=seed,
+            n_jobs=-1,
+        )
+    else:
+        raise ValueError(f"Unknown tree_model={tree_model}")
+
+    t0 = time.time()
+    clf.fit(X, y)
+    dt = time.time() - t0
+
+    info = {
+        "model": float(0),  # placeholder numeric for json safety
+        "train_samples": float(X.shape[0]),
+        "pos": float(int(y.sum())),
+        "neg": float(int((y == 0).sum())),
+        "seconds": float(dt),
+    }
+    # keep model name separately
+    info_text = {"tree_model": tree_model}
+    return clf, {**info, **{k: float(v) if isinstance(v, (int, float)) else 0.0 for k, v in info_text.items()}}
+
+
+def tune_tree_threshold(
+    clf: object,
+    Xc: np.ndarray,
+    yc: np.ndarray,
+    beta: float = 1.225,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Tune component-level threshold on calibration set.
+    """
+    if Xc.shape[0] == 0:
+        raise RuntimeError("Tree calibration set is empty.")
+    if not hasattr(clf, "predict_proba"):
+        raise RuntimeError("Tree classifier has no predict_proba.")
+
+    prob = clf.predict_proba(Xc)[:, 1].astype(np.float64)
+    best_f = -1.0
+    best_thr = 0.5
+    best_p, best_r = 0.0, 0.0
+
+    beta2 = beta * beta
+    eps = 1e-12
+
+    # scan thresholds (dense enough, but small arrays)
+    for thr in np.linspace(0.01, 0.99, 197):
+        pred = (prob >= thr).astype(np.int32)
+        tp = int(((pred == 1) & (yc == 1)).sum())
+        fp = int(((pred == 1) & (yc == 0)).sum())
+        fn = int(((pred == 0) & (yc == 1)).sum())
+
+        p = tp / (tp + fp + eps)
+        r = tp / (tp + fn + eps)
+        f = (1 + beta2) * p * r / (beta2 * p + r + eps)
+
+        if f > best_f:
+            best_f = f
+            best_thr = float(thr)
+            best_p = float(p)
+            best_r = float(r)
+
+    info = {"precision": best_p, "recall": best_r, "fbeta": float(best_f), "beta": float(beta)}
+    return best_thr, info
+
+
+# -------------------------
+# Test inference -> instance RLE submission
+# -------------------------
+def iter_sample_submission_ids(sample_csv: str) -> List[str]:
+    ids: List[str] = []
+    with open(sample_csv, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ids.append(row["ImageId"])
+    return ids
+
+
+def infer_instances_for_one_image(
+    model: torch.nn.Module,
+    device: torch.device,
+    img_path: str,
+    infer_size: int,
+    seg_thr: float,
+    clf: Optional[object],
+    tree_thr: float,
+    prop_mult: float,
+    min_area: int = 8,
+) -> List[np.ndarray]:
+    """
+    Returns list of instance masks (H,W) uint8 {0,1} at infer_size.
+    If clf is None -> just seg thresholding & components (no tree gate).
+    """
+    img = safe_load_image_rgb(img_path)
+    if infer_size != 768:
+        img = img.resize((infer_size, infer_size), resample=Image.BILINEAR)
+    x = TVF.to_tensor(img)
+    x = normalize_img_tensor(x).unsqueeze(0).to(device)
+
+    with torch.inference_mode():
+        out = model(x)
+        logits = out["out"] if isinstance(out, dict) and "out" in out else out
+        if logits.shape[-2:] != (infer_size, infer_size):
+            logits = F.interpolate(logits, size=(infer_size, infer_size), mode="bilinear", align_corners=False)
+        prob = softmax_ship_prob(logits)[0].detach().cpu().numpy().astype(np.float32)
+
+    # proposal mask (bigger recall) for component candidates
+    proposal_thr = float(np.clip(seg_thr * prop_mult, 0.01, 0.999))
+    binmask = (prob >= proposal_thr).astype(np.uint8)
+    comps = connected_components_from_binary(binmask)
+
+    inst_masks: List[np.ndarray] = []
+    if len(comps) == 0:
+        return inst_masks
+
+    # Build features for all comps, run tree gating once
+    if clf is not None:
+        X = []
+        keep_comps = []
+        for c in comps:
+            if c.area < min_area:
+                continue
+            feats = comp_features(prob, c, base_thr=seg_thr)
+            X.append(feats)
+            keep_comps.append(c)
+        if len(X) == 0:
+            return []
+        Xn = np.stack(X, axis=0).astype(np.float32)
+        p_tree = clf.predict_proba(Xn)[:, 1]
+        for c, pt in zip(keep_comps, p_tree):
+            if float(pt) >= float(tree_thr):
+                inst_masks.append(c.comp_mask.astype(np.uint8))
+        return inst_masks
+
+    # No tree: accept comps, but also apply seg_thr within comp? (optional)
+    for c in comps:
+        if c.area < min_area:
+            continue
+        inst_masks.append(c.comp_mask.astype(np.uint8))
+    return inst_masks
+
+
+def write_submission_instances(
+    out_csv: str,
+    image_ids: List[str],
+    test_img_dir: str,
+    model: torch.nn.Module,
+    device: torch.device,
+    infer_size: int,
+    seg_thr: float,
+    tree_clf: Optional[object],
+    tree_thr: float,
+    prop_mult: float,
+    min_area: int,
+    log_every: int = 200,
+) -> Dict[str, float]:
+    """
+    Output format:
+      - For each ImageId:
+          if 0 instances: write (ImageId, "")
+          else: write one row per instance (ImageId, EncodedPixels)
+    """
+    t0 = time.time()
+    rows = 0
+    non_empty_imgs = 0
+    total_instances = 0
+
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ImageId", "EncodedPixels"])
+
+        for i, img_id in enumerate(image_ids):
+            img_path = os.path.join(test_img_dir, img_id)
+            inst_masks = infer_instances_for_one_image(
+                model=model,
+                device=device,
+                img_path=img_path,
+                infer_size=infer_size,
+                seg_thr=seg_thr,
+                clf=tree_clf,
+                tree_thr=tree_thr,
+                prop_mult=prop_mult,
+                min_area=min_area,
+            )
+
+            if len(inst_masks) == 0:
+                writer.writerow([img_id, ""])
+                rows += 1
+            else:
+                non_empty_imgs += 1
+                total_instances += len(inst_masks)
+                for m in inst_masks:
+                    rle = rle_encode(m)
+                    # safety: if somehow empty, still allow as empty row
+                    writer.writerow([img_id, rle])
+                    rows += 1
+
+            if (i + 1) % log_every == 0:
+                dt = time.time() - t0
+                logging.info(f"[TEST] done {i+1}/{len(image_ids)} rows={rows} imgs_with_inst={non_empty_imgs} inst={total_instances} time={dt:.1f}s")
+
+    dt = time.time() - t0
+    return {
+        "rows": float(rows),
+        "images": float(len(image_ids)),
+        "images_with_instances": float(non_empty_imgs),
+        "instances": float(total_instances),
+        "seconds": float(dt),
+    }
+
+
+# -------------------------
+# Split handling
+# -------------------------
+def list_train_image_ids(train_img_dir: str) -> List[str]:
+    ids = []
+    for fn in os.listdir(train_img_dir):
+        if fn.lower().endswith(".jpg") or fn.lower().endswith(".jpeg") or fn.lower().endswith(".png"):
+            ids.append(fn)
+    ids.sort()
+    return ids
+
+
+def stratified_split_from_all_ids(
+    all_ids: List[str],
+    id2rles: Dict[str, List[str]],
+    seed: int,
+    n_val_seg: int,
+    n_tree_train: int,
+    n_tree_calib: int,
+) -> Dict[str, List[str]]:
+    """
+    Create val_seg / tree_train / tree_calib splits.
+    Pos/neg stratification is applied approximately by sampling within pos/neg pools.
+    """
+    rng = np.random.RandomState(seed)
+
+    pos_ids = [i for i in all_ids if len(id2rles.get(i, [])) > 0]
+    neg_ids = [i for i in all_ids if len(id2rles.get(i, [])) == 0]
+
+    rng.shuffle(pos_ids)
+    rng.shuffle(neg_ids)
+
+    # helper to draw stratified: keep same pos rate as full by default
+    total = len(all_ids)
+    pos_rate = len(pos_ids) / max(1, total)
+
+    def draw(n: int, used: set) -> List[str]:
+        n_pos = int(round(n * pos_rate))
+        n_neg = n - n_pos
+        out = []
+        # take from pos pool
+        for cand in pos_ids:
+            if len(out) >= n_pos:
+                break
+            if cand in used:
+                continue
+            out.append(cand)
+            used.add(cand)
+        # take from neg pool
+        for cand in neg_ids:
+            if len(out) >= n_pos + n_neg:
+                break
+            if cand in used:
+                continue
+            out.append(cand)
+            used.add(cand)
+        rng.shuffle(out)
+        return out
+
+    used = set()
+    val_seg = draw(n_val_seg, used)
+    tree_train = draw(n_tree_train, used)
+    tree_calib = draw(n_tree_calib, used)
+
+    return {
+        "val_seg_ids": val_seg,
+        "val_tree_train_ids": tree_train,
+        "val_tree_calib_ids": tree_calib,
+    }
+
+
+def load_or_make_splits(
+    run_dir: str,
+    train_img_dir: str,
+    id2rles: Dict[str, List[str]],
+    seed: int,
+    n_val_seg: int,
+    n_tree_train: int,
+    n_tree_calib: int,
+) -> Tuple[Dict[str, List[str]], bool]:
+    """
+    If run_dir/split_ids.json exists and has needed keys -> use it.
+    Else create and save split_ids.json into run_dir.
+    Returns (splits, created_flag)
+    """
+    split_path = os.path.join(run_dir, "split_ids.json")
+    if os.path.isfile(split_path):
+        try:
+            with open(split_path, "r") as f:
+                sp = json.load(f)
+            # accept multiple key variants
+            keys = set(sp.keys())
+            needed = {"val_seg_ids", "val_tree_train_ids", "val_tree_calib_ids"}
+            if needed.issubset(keys):
+                return {
+                    "val_seg_ids": list(sp["val_seg_ids"]),
+                    "val_tree_train_ids": list(sp["val_tree_train_ids"]),
+                    "val_tree_calib_ids": list(sp["val_tree_calib_ids"]),
+                }, False
+            # sometimes saved as nested or other naming; fall back to create
+            logging.warning("[SPLIT] split_ids.json exists but required keys not found; creating new splits for this script.")
+        except Exception as e:
+            logging.warning(f"[SPLIT] failed to read split_ids.json: {e}. Creating new splits.")
+
+    all_ids = list_train_image_ids(train_img_dir)
+    sp2 = stratified_split_from_all_ids(
+        all_ids=all_ids,
+        id2rles=id2rles,
+        seed=seed,
+        n_val_seg=n_val_seg,
+        n_tree_train=n_tree_train,
+        n_tree_calib=n_tree_calib,
+    )
+    # write
+    with open(split_path, "w") as f:
+        json.dump(sp2, f)
+    return sp2, True
+
+
+# -------------------------
+# Config
+# -------------------------
+@dataclass
+class Cfg:
+    run_dir: str
+    data_dir: str
+    train_csv: str
+    sample_sub_csv: str
+    train_img_dir: str
+    test_img_dir: str
+
+    ckpt_path: str
+    infer_size: int
+    seg_model_hint: str
+
+    seed: int
+    num_workers: int
+    batch_eval: int
+    batch_tree: int
+    batch_test: int
+
+    # splits
+    n_val_seg: int
+    n_tree_train: int
+    n_tree_calib: int
+
+    # tuning
+    beta: float
+    hist_bins: int
+
+    # tree
+    prop_mult: float
+    overlap_thr: float
+    min_area: int
+    tree_model: str
+
+    # output
+    out_csv_name: str
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run_dir", type=str, required=True, help="directory containing best_model.pth")
+    ap.add_argument("--data_dir", type=str, required=True, help="airbus-ship-detection directory")
+    ap.add_argument("--infer_size", type=int, default=768)
+
+    ap.add_argument("--seg_model", type=str, default="auto",
+                    choices=["auto", "deeplabv3_resnet50", "deeplabv3_resnet101"])
+
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--batch_eval", type=int, default=4)
+    ap.add_argument("--batch_tree", type=int, default=4)
+    ap.add_argument("--batch_test", type=int, default=2)
+
+    ap.add_argument("--n_val_seg", type=int, default=2000)
+    ap.add_argument("--n_tree_train", type=int, default=2000)
+    ap.add_argument("--n_tree_calib", type=int, default=2000)
+
+    ap.add_argument("--beta", type=float, default=1.225)
+    ap.add_argument("--hist_bins", type=int, default=2000)
+
+    ap.add_argument("--prop_mult", type=float, default=0.85, help="proposal_thr = seg_thr * prop_mult (lower => more recall)")
+    ap.add_argument("--overlap_thr", type=float, default=0.25, help="component positive if overlap/area >= overlap_thr")
+    ap.add_argument("--min_area", type=int, default=8)
+
+    ap.add_argument("--tree_model", type=str, default="hgbdt", choices=["hgbdt", "rf"])
+    ap.add_argument("--out_csv_name", type=str, default="submission.csv")
+
+    return ap.parse_args()
+
+
+def build_cfg(ns: argparse.Namespace) -> Cfg:
+    run_dir = ns.run_dir
+    data_dir = ns.data_dir
+
+    if not os.path.isdir(run_dir):
+        raise FileNotFoundError(run_dir)
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(data_dir)
+
+    ckpt_path = os.path.join(run_dir, "best_model.pth")
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(ckpt_path)
+
+    train_csv = os.path.join(data_dir, "train_ship_segmentations_v2.csv")
+    sample_sub_csv = os.path.join(data_dir, "sample_submission_v2.csv")
+    train_img_dir = os.path.join(data_dir, "train_v2")
+    test_img_dir = os.path.join(data_dir, "test_v2")
+
+    for p in [train_csv, sample_sub_csv, train_img_dir, test_img_dir]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(p)
+
+    return Cfg(
+        run_dir=run_dir,
+        data_dir=data_dir,
+        train_csv=train_csv,
+        sample_sub_csv=sample_sub_csv,
+        train_img_dir=train_img_dir,
+        test_img_dir=test_img_dir,
+        ckpt_path=ckpt_path,
+        infer_size=int(ns.infer_size),
+        seg_model_hint=str(ns.seg_model),
+        seed=int(ns.seed),
+        num_workers=int(ns.num_workers),
+        batch_eval=int(ns.batch_eval),
+        batch_tree=int(ns.batch_tree),
+        batch_test=int(ns.batch_test),
+        n_val_seg=int(ns.n_val_seg),
+        n_tree_train=int(ns.n_tree_train),
+        n_tree_calib=int(ns.n_tree_calib),
+        beta=float(ns.beta),
+        hist_bins=int(ns.hist_bins),
+        prop_mult=float(ns.prop_mult),
+        overlap_thr=float(ns.overlap_thr),
+        min_area=int(ns.min_area),
+        tree_model=str(ns.tree_model),
+        out_csv_name=str(ns.out_csv_name),
+    )
+
+
+# -------------------------
+# Main
+# -------------------------
+def main() -> None:
+    ns = parse_args()
+    cfg = build_cfg(ns)
+
+    ensure_dir(cfg.run_dir)
+    log_path = os.path.join(cfg.run_dir, f"optthr_infer_submit__{now_str()}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(log_path)],
+    )
+
+    logging.info("=== ship_optthr_infer_submit.py START ===")
+    logging.info(f"run_dir={cfg.run_dir}")
+    logging.info(f"data_dir={cfg.data_dir}")
+    logging.info(f"infer_size={cfg.infer_size}  CC_BACKEND={CC_BACKEND}")
+
+    set_seed(cfg.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"device={device} torch={torch.__version__}")
+    if device.type == "cuda":
+        logging.info(f"gpu_count={torch.cuda.device_count()} name0={torch.cuda.get_device_name(0)}")
+
+    # read RLE map
+    logging.info("[DATA] Reading train CSV (RLE -> id2rles)...")
+    id2rles = read_train_csv_id2rles(cfg.train_csv)
+    logging.info(f"[DATA] id2rles entries (pos-only images)={len([k for k,v in id2rles.items() if len(v)>0])} (dict keys total={len(id2rles)})")
+
+    # splits
+    splits, created = load_or_make_splits(
+        run_dir=cfg.run_dir,
+        train_img_dir=cfg.train_img_dir,
+        id2rles=id2rles,
+        seed=cfg.seed,
+        n_val_seg=cfg.n_val_seg,
+        n_tree_train=cfg.n_tree_train,
+        n_tree_calib=cfg.n_tree_calib,
+    )
+    logging.info(f"[SPLIT] using splits (created={created}): val_seg={len(splits['val_seg_ids'])} tree_train={len(splits['val_tree_train_ids'])} tree_calib={len(splits['val_tree_calib_ids'])}")
+
+    # load model
+    logging.info("[CKPT] Loading best_model.pth ...")
+    model, seg_model_used = load_best_model(cfg.ckpt_path, device=device, seg_model_hint=cfg.seg_model_hint)
+    logging.info(f"[CKPT] seg_model_used={seg_model_used}")
+
+    # loaders
+    val_seg_ds = AirbusValDataset(cfg.train_img_dir, splits["val_seg_ids"], id2rles, size=cfg.infer_size)
+    val_tree_train_ds = AirbusValDataset(cfg.train_img_dir, splits["val_tree_train_ids"], id2rles, size=cfg.infer_size)
+    val_tree_calib_ds = AirbusValDataset(cfg.train_img_dir, splits["val_tree_calib_ids"], id2rles, size=cfg.infer_size)
+
+    val_seg_loader = DataLoader(
+        val_seg_ds,
+        batch_size=cfg.batch_eval,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+    tree_train_loader = DataLoader(
+        val_tree_train_ds,
+        batch_size=cfg.batch_tree,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+    tree_calib_loader = DataLoader(
+        val_tree_calib_ds,
+        batch_size=cfg.batch_tree,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+
+    # 1) tune seg threshold
+    logging.info("[SEG] Tuning seg threshold (pixel Fβ) by histogram...")
+    best_thr, seg_info = tune_seg_threshold_hist(
+        model=model,
+        loader=val_seg_loader,
+        device=device,
+        bins=cfg.hist_bins,
+        beta=cfg.beta,
+    )
+    logging.info(f"[SEG] best_thr={best_thr:.6f}  Fβ={seg_info['fbeta']:.6f} P={seg_info['precision']:.6f} R={seg_info['recall']:.6f}")
+
+    # 2) build tree train set
+    logging.info("[TREE] Building tree train set (components -> features) ...")
+    Xtr, ytr, tree_build_info = build_tree_dataset_from_loader(
+        model=model,
+        loader=tree_train_loader,
+        device=device,
+        base_thr=best_thr,
+        prop_mult=cfg.prop_mult,
+        overlap_thr=cfg.overlap_thr,
+        min_area=cfg.min_area,
+    )
+    logging.info(f"[TREE] train comps(samples)={Xtr.shape[0]} pos={int(ytr.sum())} neg={int((ytr==0).sum())} proposal_thr={tree_build_info['proposal_thr']:.6f}")
+
+    # 3) train tree
+    logging.info(f"[TREE] Training tree model: {cfg.tree_model} ...")
+    tree_clf, tree_train_info = train_tree_model(Xtr, ytr, tree_model=cfg.tree_model, seed=cfg.seed)
+    logging.info("[TREE] trained OK")
+
+    # 4) build calib set
+    logging.info("[TREE] Building tree calibration set ...")
+    Xc, yc, tree_calib_build_info = build_tree_dataset_from_loader(
+        model=model,
+        loader=tree_calib_loader,
+        device=device,
+        base_thr=best_thr,
+        prop_mult=cfg.prop_mult,
+        overlap_thr=cfg.overlap_thr,
+        min_area=cfg.min_area,
+    )
+    logging.info(f"[TREE] calib comps(samples)={Xc.shape[0]} pos={int(yc.sum())} neg={int((yc==0).sum())}")
+
+    # 5) tune tree threshold
+    logging.info("[TREE] Tuning tree threshold (component Fβ) ...")
+    tree_thr, tree_thr_info = tune_tree_threshold(tree_clf, Xc, yc, beta=cfg.beta)
+    logging.info(f"[TREE] tree_thr={tree_thr:.6f}  Fβ={tree_thr_info['fbeta']:.6f} P={tree_thr_info['precision']:.6f} R={tree_thr_info['recall']:.6f}")
+
+    # save artifacts
+    tree_path = os.path.join(cfg.run_dir, "tree_model.joblib")
+    meta_path = os.path.join(cfg.run_dir, "meta.json")
+    joblib.dump(tree_clf, tree_path)
+
+    meta = {
+        "created_at": now_str(),
+        "run_dir": cfg.run_dir,
+        "data_dir": cfg.data_dir,
+        "ckpt_path": cfg.ckpt_path,
+        "seg_model_used": seg_model_used,
+        "infer_size": cfg.infer_size,
+        "seed": cfg.seed,
+        "beta": cfg.beta,
+        "hist_bins": cfg.hist_bins,
+        "seg_best_thr": best_thr,
+        "seg_info": seg_info,
+        "prop_mult": cfg.prop_mult,
+        "overlap_thr": cfg.overlap_thr,
+        "min_area": cfg.min_area,
+        "tree_model": cfg.tree_model,
+        "tree_train_build_info": tree_build_info,
+        "tree_train_info": tree_train_info,
+        "tree_calib_build_info": tree_calib_build_info,
+        "tree_best_thr": tree_thr,
+        "tree_thr_info": tree_thr_info,
+        "cc_backend": CC_BACKEND,
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    logging.info(f"[SAVE] meta.json -> {meta_path}")
+    logging.info(f"[SAVE] tree_model.joblib -> {tree_path}")
+
+    # 6) test inference -> submission.csv
+    logging.info("[TEST] Reading sample_submission_v2.csv ids ...")
+    test_ids = iter_sample_submission_ids(cfg.sample_sub_csv)
+    logging.info(f"[TEST] n_test_images={len(test_ids)}")
+
+    out_csv = os.path.join(cfg.run_dir, cfg.out_csv_name)
+    logging.info(f"[TEST] Writing submission to {out_csv} (instances-per-row; empty-image gets single empty row) ...")
+    submit_info = write_submission_instances(
+        out_csv=out_csv,
+        image_ids=test_ids,
+        test_img_dir=cfg.test_img_dir,
+        model=model,
+        device=device,
+        infer_size=cfg.infer_size,
+        seg_thr=best_thr,
+        tree_clf=tree_clf,
+        tree_thr=tree_thr,
+        prop_mult=cfg.prop_mult,
+        min_area=cfg.min_area,
+        log_every=200,
+    )
+    logging.info(f"[DONE] submission rows={int(submit_info['rows'])} images={int(submit_info['images'])} inst={int(submit_info['instances'])} time={submit_info['seconds']:.1f}s")
+    logging.info("=== ship_optthr_infer_submit.py END ===")
+
+
+if __name__ == "__main__":
+    main()
