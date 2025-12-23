@@ -1,0 +1,1644 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+segmentation_pixelwisetree.py  (v3: TTA(prob only) + emb-split default ON + anti-over-split + postprocess search)
+
+FULL pipeline (single python file) for Airbus Ship Detection (intern-winter / local GPU server):
+
+- NO pandas (CSV via stdlib csv)
+- DeepLabV3-ResNet50 segmentation (ImageNet-pretrained backbone)
+- + Instance Embedding head (discriminative instance loss)
+- + Pixel-wise tree (HistGradientBoostingClassifier) on proposal pixels
+- Threshold tuning:
+    - val_seg: seg best_thr via pixel F_beta (grid search) [uses TTA on prob if enabled]
+    - val_tree_calib: tree_thr (+ optional postprocess params) via pixel F_beta (grid search) [uses TTA on prob if enabled]
+- Test inference:
+    - seg prob (TTA averaged) -> proposal pixels -> pixelwise tree refine -> postprocess -> instance extraction
+    - embedding-based split (DEFAULT ON) with strong guards to avoid over-splitting
+    - variable-row submission: instance-per-row RLE (ImageId duplicates allowed)
+    - overlap suppression among instances
+
+FP32 only (NO AMP).
+
+Example:
+python3 segmentation_pixelwisetree.py \
+  --data_dir /home/ougaishibashi/kaggle_competition/airbus-ship-detection \
+  --out_dir  /home/ougaishibashi/kaggle_competition/outputs_airbus_full \
+  --seed 42 \
+  --train_ratio 0.90 \
+  --train_size 256 --infer_size 768 \
+  --batch_train 8 --batch_eval 4 --batch_tree 4 --batch_test 2 \
+  --num_workers 8 \
+  --pix_max_total 2000000 \
+  --search_postprocess \
+  --tta_mode flip4
+"""
+
+import os
+import sys
+import math
+import time
+import json
+import random
+import gc
+import csv
+import logging
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any
+
+import numpy as np
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision
+import torchvision.transforms.functional as TVF
+
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.cluster import KMeans
+
+# ------------------------------
+# CC backend: prefer cv2, fallback to scipy.ndimage if available
+# ------------------------------
+CC_BACKEND = None
+cv2 = None
+try:
+    import cv2
+    CC_BACKEND = "cv2"
+except Exception:
+    cv2 = None
+    CC_BACKEND = None
+
+ndi = None
+try:
+    from scipy import ndimage as ndi
+    if CC_BACKEND is None:
+        CC_BACKEND = "scipy"
+except Exception:
+    ndi = None
+
+# ------------------------------
+# Reproducibility
+# ------------------------------
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True  # speed > determinism
+
+# ------------------------------
+# Args
+# ------------------------------
+def build_argparser():
+    import argparse
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--data_dir", type=str, required=True,
+                   help="Airbus dataset dir containing train_ship_segmentations_v2.csv, sample_submission_v2.csv, train_v2/, test_v2/")
+    p.add_argument("--out_dir", type=str, required=True, help="Output directory for runs")
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--train_ratio", type=float, default=0.90,
+                   help="ratio for TRAIN split; rest is split equally into val_seg/val_tree_train/val_tree_calib")
+
+    p.add_argument("--train_size", type=int, default=256, help="train resize (square)")
+    p.add_argument("--infer_size", type=int, default=768, help="inference resize (square)")
+
+    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--batch_train", type=int, default=8)
+    p.add_argument("--batch_eval", type=int, default=4)
+    p.add_argument("--batch_tree", type=int, default=4)
+    p.add_argument("--batch_test", type=int, default=2)
+
+    # training
+    p.add_argument("--max_epochs", type=int, default=8)
+    p.add_argument("--patience", type=int, default=2)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--wd", type=float, default=1e-4)
+    p.add_argument("--clip_grad", type=float, default=5.0)
+
+    # metric / threshold search
+    p.add_argument("--beta_f", type=float, default=1.225, help="pixel F_beta beta")
+    p.add_argument("--thr_steps", type=int, default=19, help="threshold grid steps from 0.05..0.95")
+    p.add_argument("--thr_min", type=float, default=0.05)
+    p.add_argument("--thr_max", type=float, default=0.95)
+
+    # losses
+    p.add_argument("--tversky_alpha", type=float, default=0.4)
+    p.add_argument("--tversky_beta", type=float, default=0.6)
+    p.add_argument("--tversky_lambda", type=float, default=1.0)
+
+    p.add_argument("--emb_dim", type=int, default=8)
+    p.add_argument("--lambda_inst", type=float, default=0.1)
+
+    p.add_argument("--delta_v", type=float, default=0.5)
+    p.add_argument("--delta_d", type=float, default=1.5)
+    p.add_argument("--inst_alpha", type=float, default=1.0)
+    p.add_argument("--inst_beta", type=float, default=1.0)
+    p.add_argument("--inst_gamma", type=float, default=0.001)
+    p.add_argument("--inst_max_points", type=int, default=2000)
+
+    # proposal / pixel-tree
+    p.add_argument("--prop_mult", type=float, default=0.85, help="proposal_thr = best_thr * prop_mult")
+    p.add_argument("--pix_pos_per_img", type=int, default=800)
+    p.add_argument("--pix_neg_per_img", type=int, default=1600)
+    p.add_argument("--pix_max_total", type=int, default=2_000_000)
+    p.add_argument("--pix_min_cand_area", type=int, default=1, help="min candidate pixels to consider tree sampling (safety)")
+
+    # tree model
+    p.add_argument("--tree_lr", type=float, default=0.1)
+    p.add_argument("--tree_max_depth", type=int, default=6)
+    p.add_argument("--tree_max_iter", type=int, default=200)
+
+    # instance extraction / split (DEFAULT ON; disable with --disable_emb_split)
+    p.add_argument("--disable_emb_split", action="store_true",
+                   help="Disable embedding/watershed based split (default: enabled).")
+    p.add_argument("--min_area_inst", type=int, default=15)
+
+    # split guards (stronger than v1)
+    p.add_argument("--split_area_trigger", type=int, default=220)
+    p.add_argument("--split_min_area", type=int, default=25)
+    p.add_argument("--split_min_peak_dist", type=int, default=18, help="min distance between peaks (pixels) to allow split")
+    p.add_argument("--split_peak_q", type=float, default=0.88, help="quantile of prob inside component to form peak markers")
+    p.add_argument("--split_min_peak_mean_prob", type=float, default=0.22, help="min mean prob around each marker")
+    p.add_argument("--split_min_cent_dist", type=float, default=0.35)
+    p.add_argument("--split_min_emb_dist", type=float, default=0.25, help="min distance between mean embeddings of parts")
+    p.add_argument("--split_min_mean_prob", type=float, default=0.12)
+
+    # postprocess search (tree calib stage)
+    p.add_argument("--search_postprocess", action="store_true",
+                   help="Search postprocess params jointly with tree_thr on val_tree_calib (default OFF).")
+    p.add_argument("--pp_open_list", type=str, default="0,1",
+                   help="comma list of open iterations (0 means disabled)")
+    p.add_argument("--pp_close_list", type=str, default="0,3,5,7",
+                   help="comma list of close kernel size (0 means disabled)")
+    p.add_argument("--pp_min_area_list", type=str, default="0,10,15,20",
+                   help="comma list of min-area removal threshold (0 means disabled)")
+    p.add_argument("--pp_merge_ks_list", type=str, default="0,7,9",
+                   help="comma list of merge kernel size (0 means disabled)")
+    p.add_argument("--pp_merge_iters_list", type=str, default="0,1,2",
+                   help="comma list of merge iterations (0 means disabled)")
+    p.add_argument("--pp_bridge_thr_list", type=str, default="0.00,0.30,0.35",
+                   help="comma list of bridge threshold on prob (0 disables bridging)")
+
+    # ---- TTA (prob only) ----
+    p.add_argument("--tta_mode", type=str, default="flip4",
+                   choices=["none", "hflip", "flip4"],
+                   help="TTA mode for probability map only. emb is NOT TTA-averaged (default: flip4).")
+
+    return p
+
+def _parse_int_list(s: str) -> List[int]:
+    out = []
+    for x in s.split(","):
+        x = x.strip()
+        if x:
+            out.append(int(x))
+    return out
+
+def _parse_float_list(s: str) -> List[float]:
+    out = []
+    for x in s.split(","):
+        x = x.strip()
+        if x:
+            out.append(float(x))
+    return out
+
+# ------------------------------
+# Paths / constants
+# ------------------------------
+IMG_H = 768
+IMG_W = 768
+
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)
+IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
+
+def normalize_img(x: torch.Tensor) -> torch.Tensor:
+    mean = IMAGENET_MEAN.to(x.device, x.dtype)[:, None, None]
+    std  = IMAGENET_STD.to(x.device, x.dtype)[:, None, None]
+    return (x - mean) / std
+
+def read_image_rgb(path: str) -> torch.Tensor:
+    img = Image.open(path).convert("RGB")
+    arr = np.array(img)  # HWC uint8
+    x = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # CHW
+    return x
+
+# ------------------------------
+# RLE decode/encode (Airbus format)
+# ------------------------------
+def rle_decode(rle: str, shape=(768, 768)) -> np.ndarray:
+    if rle is None or (not isinstance(rle, str)) or len(rle.strip()) == 0:
+        return np.zeros(shape, dtype=np.uint8)
+    s = rle.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    img = np.zeros(shape[0] * shape[1], dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        img[lo:hi] = 1
+    return img.reshape((shape[1], shape[0]), order="F").T
+
+def rle_encode(mask: np.ndarray) -> str:
+    if mask is None:
+        return ""
+    m = mask.astype(np.uint8)
+    if m.sum() == 0:
+        return ""
+    pixels = m.T.flatten(order="F")
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+def sum_ship_pixels_from_rles(rles: List[str]) -> int:
+    if rles is None:
+        return 0
+    total = 0
+    for rle in rles:
+        if not isinstance(rle, str) or len(rle.strip()) == 0:
+            continue
+        s = rle.strip().split()
+        lengths = s[1::2]
+        total += sum(int(x) for x in lengths)
+    return total
+
+def build_semantic_mask_from_rles(rles: List[str], shape=(768,768)) -> np.ndarray:
+    if rles is None or len(rles) == 0:
+        return np.zeros(shape, dtype=np.uint8)
+    m = np.zeros(shape, dtype=np.uint8)
+    for r in rles:
+        m |= rle_decode(r, shape=shape)
+    return m
+
+def build_instance_id_mask_from_rles(rles: List[str], shape=(768,768)) -> np.ndarray:
+    """
+    instance id mask: background=0, instance ids=1..K
+    (simple overwrite in case of overlaps)
+    """
+    if rles is None or len(rles) == 0:
+        return np.zeros(shape, dtype=np.int32)
+    inst = np.zeros(shape, dtype=np.int32)
+    k = 0
+    for r in rles:
+        k += 1
+        m = rle_decode(r, shape=shape).astype(np.uint8)
+        inst[m > 0] = k
+    return inst
+
+# ------------------------------
+# CSV (NO pandas)
+# ------------------------------
+def read_train_csv_id2rles(train_csv: str) -> Dict[str, List[str]]:
+    id2rles: Dict[str, List[str]] = {}
+    with open(train_csv, "r", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header is None:
+            raise RuntimeError("Empty train csv")
+        try:
+            idx_id = header.index("ImageId")
+            idx_rle = header.index("EncodedPixels")
+        except ValueError:
+            raise RuntimeError(f"Unexpected header in {train_csv}: {header}")
+
+        for row in reader:
+            if not row or len(row) <= max(idx_id, idx_rle):
+                continue
+            img_id = row[idx_id].strip()
+            rle = row[idx_rle].strip() if row[idx_rle] is not None else ""
+            if len(rle) > 0:
+                id2rles.setdefault(img_id, []).append(rle)
+    return id2rles
+
+def read_sample_submission_ids(sample_sub_csv: str) -> List[str]:
+    ids: List[str] = []
+    with open(sample_sub_csv, "r", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header is None:
+            raise RuntimeError("Empty sample submission csv")
+        try:
+            idx_id = header.index("ImageId")
+        except ValueError:
+            raise RuntimeError(f"Unexpected header in {sample_sub_csv}: {header}")
+        for row in reader:
+            if not row or len(row) <= idx_id:
+                continue
+            img_id = row[idx_id].strip()
+            if img_id:
+                ids.append(img_id)
+    return ids
+
+# ------------------------------
+# Split
+# ------------------------------
+def stratified_split_ids(pos_ids: List[str], neg_ids: List[str], train_ratio: float, seed: int) -> Tuple[List[str], List[str]]:
+    rng = np.random.default_rng(seed)
+    pos = pos_ids.copy()
+    neg = neg_ids.copy()
+    rng.shuffle(pos)
+    rng.shuffle(neg)
+    pos_n = int(round(len(pos) * train_ratio))
+    neg_n = int(round(len(neg) * train_ratio))
+    train_ids = pos[:pos_n] + neg[:neg_n]
+    rest_ids = pos[pos_n:] + neg[neg_n:]
+    rng.shuffle(train_ids)
+    rng.shuffle(rest_ids)
+    return train_ids, rest_ids
+
+def split_rest_three(rest_ids: List[str], seed: int) -> Tuple[List[str], List[str], List[str]]:
+    rng = np.random.default_rng(seed)
+    ids = rest_ids.copy()
+    rng.shuffle(ids)
+    n = len(ids)
+    n_each = n // 3
+    a = ids[:n_each]
+    b = ids[n_each:2*n_each]
+    c = ids[2*n_each:]
+    return a, b, c
+
+# ------------------------------
+# Datasets
+# ------------------------------
+@dataclass
+class Cfg:
+    train_size: int
+    infer_size: int
+    num_workers: int
+    batch_train: int
+    batch_eval: int
+    batch_tree: int
+    batch_test: int
+
+class AirbusTrainDataset(Dataset):
+    def __init__(self, img_dir: str, ids: List[str], id2rles: Dict[str, List[str]], out_size: int):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.id2rles = id2rles
+        self.out_size = out_size
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        img_id = self.ids[idx]
+        img_path = os.path.join(self.img_dir, img_id)
+
+        x = read_image_rgb(img_path).float() / 255.0
+        x = TVF.resize(x, [self.out_size, self.out_size], interpolation=TVF.InterpolationMode.BILINEAR)
+        x = normalize_img(x)
+
+        rles = self.id2rles.get(img_id, [])
+        y_sem = build_semantic_mask_from_rles(rles, shape=(IMG_H, IMG_W)).astype(np.uint8)
+        y_inst = build_instance_id_mask_from_rles(rles, shape=(IMG_H, IMG_W)).astype(np.int32)
+
+        y_sem_t = torch.from_numpy(y_sem)[None, ...].float()
+        y_inst_t = torch.from_numpy(y_inst)[None, ...].long()
+
+        y_sem_t = TVF.resize(y_sem_t, [self.out_size, self.out_size], interpolation=TVF.InterpolationMode.NEAREST)
+        y_inst_t = TVF.resize(y_inst_t.float(), [self.out_size, self.out_size], interpolation=TVF.InterpolationMode.NEAREST).long()
+
+        y_sem_t = (y_sem_t > 0.5).float()
+        y_inst_t = y_inst_t.clamp_min(0)
+
+        return img_id, x, y_sem_t, y_inst_t
+
+class AirbusEvalDataset(Dataset):
+    def __init__(self, img_dir: str, ids: List[str], id2rles: Dict[str, List[str]], out_size: int):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.id2rles = id2rles
+        self.out_size = out_size
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        img_id = self.ids[idx]
+        img_path = os.path.join(self.img_dir, img_id)
+
+        x = read_image_rgb(img_path).float() / 255.0
+        x = TVF.resize(x, [self.out_size, self.out_size], interpolation=TVF.InterpolationMode.BILINEAR)
+        x = normalize_img(x)
+
+        rles = self.id2rles.get(img_id, [])
+        y_sem = build_semantic_mask_from_rles(rles, shape=(IMG_H, IMG_W)).astype(np.uint8)
+        y_sem_t = torch.from_numpy(y_sem)[None, ...].float()
+        y_sem_t = TVF.resize(y_sem_t, [self.out_size, self.out_size], interpolation=TVF.InterpolationMode.NEAREST)
+        y_sem_t = (y_sem_t > 0.5).float()
+
+        return img_id, x, y_sem_t
+
+class TestDataset(Dataset):
+    def __init__(self, img_dir: str, ids: List[str], out_size: int):
+        self.img_dir = img_dir
+        self.ids = ids
+        self.out_size = out_size
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        img_id = self.ids[idx]
+        img_path = os.path.join(self.img_dir, img_id)
+
+        x = read_image_rgb(img_path).float() / 255.0
+        x = TVF.resize(x, [self.out_size, self.out_size], interpolation=TVF.InterpolationMode.BILINEAR)
+        x = normalize_img(x)
+
+        return img_id, x
+
+# ------------------------------
+# pos_ratio estimate (via RLE lengths)
+# ------------------------------
+def estimate_pos_ratio_from_ids(ids: List[str], id2rles: Dict[str, List[str]], H=768, W=768) -> float:
+    total_pixels = len(ids) * H * W
+    ship_pixels = 0
+    for img_id in ids:
+        ship_pixels += sum_ship_pixels_from_rles(id2rles.get(img_id, []))
+    ship_pixels = max(ship_pixels, 1)
+    return ship_pixels / total_pixels
+
+# ------------------------------
+# Model: DeepLabV3 + embedding head
+# ------------------------------
+class DeepLabV3WithEmbedding(nn.Module):
+    def __init__(self, base_model: nn.Module, emb_dim: int = 8):
+        super().__init__()
+        self.base = base_model
+        self.emb_head = nn.Sequential(
+            nn.Conv2d(2048, 256, kernel_size=1, bias=False),
+            nn.GroupNorm(32, 256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, emb_dim, kernel_size=1, bias=True)
+        )
+        self.emb_dim = emb_dim
+
+    def forward(self, x):
+        input_shape = x.shape[-2:]
+        features = self.base.backbone(x)
+        feat = features["out"]
+        seg_logits = self.base.classifier(feat)
+        seg_logits = F.interpolate(seg_logits, size=input_shape, mode="bilinear", align_corners=False)
+
+        emb = self.emb_head(feat)
+        emb = F.interpolate(emb, size=input_shape, mode="bilinear", align_corners=False)
+        emb = F.normalize(emb, p=2, dim=1, eps=1e-6)
+        return {"seg": seg_logits, "emb": emb}
+
+# ------------------------------
+# Losses
+# ------------------------------
+class SoftTverskyLoss(nn.Module):
+    def __init__(self, alpha: float = 0.4, beta: float = 0.6, smooth: float = 1e-6):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.smooth = float(smooth)
+
+    def forward(self, probs_fg: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        p = probs_fg
+        y = target
+        tp = (p * y).sum(dim=(1, 2, 3))
+        fp = (p * (1 - y)).sum(dim=(1, 2, 3))
+        fn = ((1 - p) * y).sum(dim=(1, 2, 3))
+        tversky = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
+        return 1.0 - tversky.mean()
+
+class DiscriminativeInstanceLoss(nn.Module):
+    def __init__(self, delta_v=0.5, delta_d=1.5, alpha=1.0, beta=1.0, gamma=0.001, eps=1e-6,
+                 max_points_per_inst=2000):
+        super().__init__()
+        self.delta_v = float(delta_v)
+        self.delta_d = float(delta_d)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.gamma = float(gamma)
+        self.eps = float(eps)
+        self.max_points_per_inst = int(max_points_per_inst)
+
+    def forward(self, emb: torch.Tensor, inst_id: torch.Tensor) -> torch.Tensor:
+        N, D, H, W = emb.shape
+        loss_total = emb.new_tensor(0.0)
+        valid_images = 0
+
+        for n in range(N):
+            ids = inst_id[n, 0]
+            unique = torch.unique(ids)
+            unique = unique[unique > 0]
+            if int(unique.numel()) <= 0:
+                continue
+
+            E = emb[n]
+            mus = []
+            var_term = emb.new_tensor(0.0)
+
+            for k_id in unique:
+                mask = (ids == k_id)
+                idx = mask.reshape(-1).nonzero(as_tuple=False).squeeze(1)
+                if idx.numel() == 0:
+                    continue
+                if idx.numel() > self.max_points_per_inst:
+                    perm = torch.randperm(idx.numel(), device=idx.device)[:self.max_points_per_inst]
+                    idx = idx[perm]
+
+                pts = E.reshape(D, -1)[:, idx].T
+                mu = pts.mean(dim=0)
+                mus.append(mu)
+
+                dist = torch.norm(pts - mu[None, :], dim=1)
+                var_term = var_term + torch.mean(torch.clamp(dist - self.delta_v, min=0.0) ** 2)
+
+            if len(mus) <= 0:
+                continue
+
+            mus = torch.stack(mus, dim=0)
+            K_eff = mus.shape[0]
+            var_term = var_term / max(K_eff, 1)
+
+            if K_eff > 1:
+                diff = mus[:, None, :] - mus[None, :, :]
+                dist_mat = torch.norm(diff + self.eps, dim=-1)
+                i, j = torch.triu_indices(K_eff, K_eff, offset=1, device=emb.device)
+                d = dist_mat[i, j]
+                dist_term = torch.mean(torch.clamp(2.0 * self.delta_d - d, min=0.0) ** 2)
+            else:
+                dist_term = emb.new_tensor(0.0)
+
+            reg_term = torch.mean(torch.norm(mus, dim=1))
+            loss = self.alpha * var_term + self.beta * dist_term + self.gamma * reg_term
+            loss_total = loss_total + loss
+            valid_images += 1
+
+        if valid_images == 0:
+            return emb.new_tensor(0.0)
+        return loss_total / valid_images
+
+# ------------------------------
+# Metrics / threshold search
+# ------------------------------
+@torch.no_grad()
+def compute_best_thr_fbeta(model: nn.Module, loader: DataLoader, device: torch.device,
+                           beta: float, thr_grid: np.ndarray, tta_mode: str) -> Tuple[float, float]:
+    model.eval()
+    tp = np.zeros_like(thr_grid, dtype=np.float64)
+    fp = np.zeros_like(thr_grid, dtype=np.float64)
+    fn = np.zeros_like(thr_grid, dtype=np.float64)
+
+    for batch in loader:
+        _, x, y = batch
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        probs = forward_prob_tta(model, x, tta_mode=tta_mode)  # [N,1,H,W] numpy
+        p = probs.reshape(-1)
+        t = y.detach().float().reshape(-1).cpu().numpy().astype(np.uint8)
+
+        for i, thr in enumerate(thr_grid):
+            pred = (p >= thr).astype(np.uint8)
+            tp[i] += np.sum((pred == 1) & (t == 1))
+            fp[i] += np.sum((pred == 1) & (t == 0))
+            fn[i] += np.sum((pred == 0) & (t == 1))
+
+    b2 = beta * beta
+    fbeta = (1 + b2) * tp / ((1 + b2) * tp + b2 * fn + fp + 1e-12)
+    bi = int(np.argmax(fbeta))
+    return float(thr_grid[bi]), float(fbeta[bi])
+
+def pixel_fbeta(pred01: np.ndarray, gt01: np.ndarray, beta: float) -> float:
+    pred = (pred01 > 0).astype(np.uint8)
+    gt = (gt01 > 0).astype(np.uint8)
+    tp = float(((pred == 1) & (gt == 1)).sum())
+    fp = float(((pred == 1) & (gt == 0)).sum())
+    fn = float(((pred == 0) & (gt == 1)).sum())
+    b2 = beta * beta
+    return (1 + b2) * tp / ((1 + b2) * tp + b2 * fn + fp + 1e-12)
+
+# ------------------------------
+# Connected components
+# ------------------------------
+def connected_components(mask01: np.ndarray) -> Tuple[int, np.ndarray]:
+    if mask01.sum() == 0:
+        return 1, np.zeros_like(mask01, dtype=np.int32)
+
+    if cv2 is not None:
+        num, lab = cv2.connectedComponents(mask01, connectivity=8)
+        return int(num), lab.astype(np.int32)
+
+    if ndi is not None:
+        lab, num = ndi.label(mask01.astype(bool))
+        lab = lab.astype(np.int32)
+        return int(num + 1), lab
+
+    H, W = mask01.shape
+    lab = np.zeros((H, W), dtype=np.int32)
+    cid = 0
+    for y in range(H):
+        for x in range(W):
+            if mask01[y, x] == 0 or lab[y, x] != 0:
+                continue
+            cid += 1
+            q = [(y, x)]
+            lab[y, x] = cid
+            while q:
+                yy, xx = q.pop()
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dy == 0 and dx == 0:
+                            continue
+                        ny, nx = yy + dy, xx + dx
+                        if 0 <= ny < H and 0 <= nx < W:
+                            if mask01[ny, nx] == 1 and lab[ny, nx] == 0:
+                                lab[ny, nx] = cid
+                                q.append((ny, nx))
+    return int(cid + 1), lab
+
+# ------------------------------
+# Pixel-wise tree features (proposal pixels)
+# ------------------------------
+def local_mean_max_3x3(prob: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if cv2 is not None:
+        k = np.ones((3, 3), np.float32) / 9.0
+        mean = cv2.filter2D(prob, -1, k, borderType=cv2.BORDER_REFLECT)
+        maxv = cv2.dilate(prob, np.ones((3, 3), np.uint8), iterations=1)
+        return mean.astype(np.float32), maxv.astype(np.float32)
+
+    pad = 1
+    p = np.pad(prob, ((pad, pad), (pad, pad)), mode="reflect")
+    H, W = prob.shape
+    mean = np.zeros((H, W), np.float32)
+    maxv = np.zeros((H, W), np.float32)
+    for y in range(H):
+        for x in range(W):
+            patch = p[y:y+3, x:x+3]
+            mean[y, x] = float(patch.mean())
+            maxv[y, x] = float(patch.max())
+    return mean, maxv
+
+def build_pixel_features(prob: np.ndarray, emb: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
+    H, W = prob.shape
+    mean3, max3 = local_mean_max_3x3(prob)
+    p = prob[ys, xs]
+    m = mean3[ys, xs]
+    mx = max3[ys, xs]
+    x_norm = xs.astype(np.float32) / max(W - 1, 1)
+    y_norm = ys.astype(np.float32) / max(H - 1, 1)
+    E = emb[:, ys, xs].T
+    feat = np.concatenate(
+        [p[:, None], m[:, None], mx[:, None], x_norm[:, None], y_norm[:, None], E],
+        axis=1
+    ).astype(np.float32)
+    return feat
+
+def sample_pixels_for_tree(prob: np.ndarray, gt: np.ndarray, proposal_thr: float,
+                           pos_per_img: int, neg_per_img: int,
+                           rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
+    cand = (prob >= proposal_thr).astype(np.uint8)
+    ys, xs = np.where(cand > 0)
+    if len(xs) == 0:
+        return np.zeros((0,), np.int64), np.zeros((0,), np.int64)
+
+    lbl = gt[ys, xs].astype(np.uint8)
+    pos_idx = np.where(lbl == 1)[0]
+    neg_idx = np.where(lbl == 0)[0]
+
+    take_pos = min(pos_per_img, len(pos_idx))
+    take_neg = min(neg_per_img, len(neg_idx))
+    if take_pos <= 0 and take_neg <= 0:
+        return np.zeros((0,), np.int64), np.zeros((0,), np.int64)
+
+    sel = []
+    if take_pos > 0:
+        sel_pos = rng.choice(pos_idx, size=take_pos, replace=False)
+        sel.append(sel_pos)
+    if take_neg > 0:
+        sel_neg = rng.choice(neg_idx, size=take_neg, replace=False)
+        sel.append(sel_neg)
+    sel = np.concatenate(sel, axis=0) if len(sel) else np.zeros((0,), np.int64)
+    return ys[sel].astype(np.int64), xs[sel].astype(np.int64)
+
+def apply_pixel_tree(prob: np.ndarray, emb: np.ndarray, proposal_thr: float,
+                     tree: HistGradientBoostingClassifier, tree_thr: float) -> np.ndarray:
+    cand = (prob >= proposal_thr)
+    ys, xs = np.where(cand)
+    if len(xs) == 0:
+        return np.zeros_like(prob, dtype=np.uint8)
+    Xpix = build_pixel_features(prob, emb, ys, xs)
+    proba = tree.predict_proba(Xpix)[:, 1]
+    keep = (proba >= tree_thr).astype(np.uint8)
+    out = np.zeros_like(prob, dtype=np.uint8)
+    out[ys, xs] = keep
+    return out
+
+# ------------------------------
+# Postprocess (cv2 preferred)
+# ------------------------------
+def _morph_open(mask01: np.ndarray, iters: int) -> np.ndarray:
+    if iters <= 0:
+        return mask01
+    if cv2 is None:
+        return mask01
+    k = np.ones((3, 3), np.uint8)
+    out = mask01.copy().astype(np.uint8)
+    out = cv2.morphologyEx(out, cv2.MORPH_OPEN, k, iterations=int(iters))
+    return out
+
+def _morph_close(mask01: np.ndarray, ksize: int) -> np.ndarray:
+    if ksize <= 0:
+        return mask01
+    if cv2 is None:
+        return mask01
+    k = np.ones((int(ksize), int(ksize)), np.uint8)
+    out = mask01.copy().astype(np.uint8)
+    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, k, iterations=1)
+    return out
+
+def _remove_small(mask01: np.ndarray, min_area: int) -> np.ndarray:
+    if min_area <= 0:
+        return mask01
+    num, lab = connected_components(mask01.astype(np.uint8))
+    out = np.zeros_like(mask01, dtype=np.uint8)
+    for cid in range(1, num):
+        comp = (lab == cid)
+        if int(comp.sum()) >= int(min_area):
+            out[comp] = 1
+    return out
+
+def _merge_close(mask01: np.ndarray, ksize: int, iters: int) -> np.ndarray:
+    if ksize <= 0 or iters <= 0:
+        return mask01
+    if cv2 is None:
+        return mask01
+    k = np.ones((int(ksize), int(ksize)), np.uint8)
+    out = mask01.copy().astype(np.uint8)
+    out = cv2.dilate(out, k, iterations=int(iters))
+    out = cv2.erode(out, k, iterations=int(iters))
+    return out
+
+def _bridge_by_prob(mask01: np.ndarray, prob: np.ndarray, thr: float) -> np.ndarray:
+    if thr <= 0.0:
+        return mask01
+    add = (prob >= float(thr)).astype(np.uint8)
+    out = (mask01.astype(np.uint8) | add).astype(np.uint8)
+    return out
+
+def postprocess_mask(mask01: np.ndarray, prob: np.ndarray,
+                     open_iters: int, close_ks: int, min_area: int,
+                     merge_ks: int, merge_iters: int, bridge_thr: float) -> np.ndarray:
+    out = mask01.astype(np.uint8)
+    out = _bridge_by_prob(out, prob, bridge_thr)
+    out = _morph_open(out, open_iters)
+    out = _morph_close(out, close_ks)
+    out = _remove_small(out, min_area)
+    out = _merge_close(out, merge_ks, merge_iters)
+    out = (out > 0).astype(np.uint8)
+    return out
+
+# ------------------------------
+# TTA (prob only)
+# ------------------------------
+@torch.no_grad()
+def _model_prob(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    out = model(x)["seg"]
+    prob = torch.softmax(out, dim=1)[:, 1:2, :, :]
+    return prob
+
+@torch.no_grad()
+def forward_prob_tta(model: nn.Module, x: torch.Tensor, tta_mode: str) -> np.ndarray:
+    """
+    Return prob map as numpy [N,1,H,W], applying TTA on prob only.
+    """
+    model.eval()
+    if tta_mode == "none":
+        p = _model_prob(model, x)
+        return p.detach().float().cpu().numpy()
+
+    if tta_mode == "hflip":
+        p0 = _model_prob(model, x)
+        xf = torch.flip(x, dims=[3])
+        pf = _model_prob(model, xf)
+        pf = torch.flip(pf, dims=[3])
+        p = 0.5 * (p0 + pf)
+        return p.detach().float().cpu().numpy()
+
+    # flip4: original + hflip + vflip + hvflip
+    p0 = _model_prob(model, x)
+
+    xh = torch.flip(x, dims=[3])
+    ph = _model_prob(model, xh)
+    ph = torch.flip(ph, dims=[3])
+
+    xv = torch.flip(x, dims=[2])
+    pv = _model_prob(model, xv)
+    pv = torch.flip(pv, dims=[2])
+
+    xhv = torch.flip(x, dims=[2, 3])
+    phv = _model_prob(model, xhv)
+    phv = torch.flip(phv, dims=[2, 3])
+
+    p = 0.25 * (p0 + ph + pv + phv)
+    return p.detach().float().cpu().numpy()
+
+@torch.no_grad()
+def forward_emb_no_tta(model: nn.Module, x: torch.Tensor) -> np.ndarray:
+    """
+    Return embedding as numpy [N,D,H,W] without TTA averaging (stability for splitting).
+    """
+    model.eval()
+    emb = model(x)["emb"]
+    return emb.detach().float().cpu().numpy()
+
+# ------------------------------
+# Split (anti-over-split): watershed markers + embedding check
+# ------------------------------
+def _find_peak_markers_in_component(prob: np.ndarray, comp_mask: np.ndarray,
+                                    peak_q: float, min_peak_dist: int) -> Tuple[np.ndarray, List[Tuple[int,int]]]:
+    ys, xs = np.where(comp_mask > 0)
+    if len(xs) == 0:
+        return np.zeros_like(comp_mask, dtype=np.int32), []
+    vals = prob[ys, xs]
+    thr = float(np.quantile(vals, peak_q))
+    seed = ((prob >= thr) & (comp_mask > 0)).astype(np.uint8)
+    if seed.sum() == 0:
+        return np.zeros_like(comp_mask, dtype=np.int32), []
+
+    if cv2 is not None:
+        num, lab = cv2.connectedComponents(seed, connectivity=8)
+        if num <= 2:
+            centers = []
+            for cid in range(1, num):
+                m = (lab == cid)
+                yx = np.argwhere(m)
+                cy, cx = yx.mean(axis=0)
+                centers.append((int(round(cy)), int(round(cx))))
+            return lab.astype(np.int32), centers
+
+        comps = []
+        for cid in range(1, num):
+            m = (lab == cid)
+            a = int(m.sum())
+            if a <= 0:
+                continue
+            mp = float(prob[m].mean())
+            yx = np.argwhere(m)
+            cy, cx = yx.mean(axis=0)
+            comps.append((mp, a, cid, int(round(cy)), int(round(cx))))
+        comps.sort(key=lambda x: (-x[0], -x[1]))
+        comps = comps[:2]
+        if len(comps) < 2:
+            cid = comps[0][2]
+            outm = np.zeros_like(lab, dtype=np.int32)
+            outm[lab == cid] = 1
+            return outm, [(comps[0][3], comps[0][4])]
+
+        (mp1, a1, cid1, cy1, cx1), (mp2, a2, cid2, cy2, cx2) = comps[0], comps[1]
+        if (cy1 - cy2) ** 2 + (cx1 - cx2) ** 2 < int(min_peak_dist) ** 2:
+            outm = np.zeros_like(lab, dtype=np.int32)
+            outm[lab == cid1] = 1
+            return outm, [(cy1, cx1)]
+
+        outm = np.zeros_like(lab, dtype=np.int32)
+        outm[lab == cid1] = 1
+        outm[lab == cid2] = 2
+        return outm, [(cy1, cx1), (cy2, cx2)]
+
+    return np.zeros_like(comp_mask, dtype=np.int32), []
+
+def _watershed_split(prob: np.ndarray, comp_mask: np.ndarray,
+                     markers: np.ndarray) -> List[np.ndarray]:
+    if cv2 is None:
+        return [comp_mask.astype(np.uint8)]
+    img = (255.0 * (1.0 - np.clip(prob, 0.0, 1.0))).astype(np.uint8)
+    img3 = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    mk = markers.astype(np.int32).copy()
+    mk[comp_mask == 0] = 0
+    ws = cv2.watershed(img3, mk)
+
+    regions = []
+    for k in [1, 2]:
+        m = ((ws == k) & (comp_mask > 0)).astype(np.uint8)
+        if int(m.sum()) > 0:
+            regions.append(m)
+    if len(regions) < 2:
+        return [comp_mask.astype(np.uint8)]
+    return regions
+
+def split_component_safely(prob: np.ndarray, emb: np.ndarray, comp_mask: np.ndarray,
+                           seed: int,
+                           min_area: int,
+                           min_cent_dist: float,
+                           min_emb_dist: float,
+                           min_mean_prob: float,
+                           peak_q: float,
+                           min_peak_dist: int,
+                           min_peak_mean_prob: float,
+                           max_samples: int = 6000) -> List[np.ndarray]:
+    ys, xs = np.where(comp_mask > 0)
+    area = int(len(xs))
+    if area < int(min_area) * 3:
+        return [comp_mask.astype(np.uint8)]
+
+    markers, centers = _find_peak_markers_in_component(prob, comp_mask, peak_q=peak_q, min_peak_dist=min_peak_dist)
+    if len(centers) < 2:
+        return [comp_mask.astype(np.uint8)]
+
+    ok_peaks = 0
+    for (cy, cx) in centers[:2]:
+        y0 = max(cy - 6, 0); y1 = min(cy + 7, prob.shape[0])
+        x0 = max(cx - 6, 0); x1 = min(cx + 7, prob.shape[1])
+        patch = prob[y0:y1, x0:x1]
+        if patch.size > 0 and float(patch.mean()) >= float(min_peak_mean_prob):
+            ok_peaks += 1
+    if ok_peaks < 2:
+        return [comp_mask.astype(np.uint8)]
+
+    if cv2 is not None:
+        parts = _watershed_split(prob, comp_mask, markers)
+    else:
+        parts = [comp_mask.astype(np.uint8)]
+
+    if len(parts) >= 2:
+        parts2 = []
+        for m in parts[:2]:
+            a = int(m.sum())
+            if a < int(min_area):
+                return [comp_mask.astype(np.uint8)]
+            mp = float(prob[m > 0].mean()) if a > 0 else 0.0
+            if mp < float(min_mean_prob):
+                return [comp_mask.astype(np.uint8)]
+            parts2.append(m.astype(np.uint8))
+        if len(parts2) < 2:
+            return [comp_mask.astype(np.uint8)]
+
+        def mean_emb(m: np.ndarray) -> np.ndarray:
+            ys2, xs2 = np.where(m > 0)
+            if len(xs2) == 0:
+                return None
+            if len(xs2) > max_samples:
+                idx = np.random.default_rng(seed).choice(len(xs2), size=max_samples, replace=False)
+                ys2 = ys2[idx]; xs2 = xs2[idx]
+            E = emb[:, ys2, xs2].T
+            return E.mean(axis=0)
+
+        e1 = mean_emb(parts2[0]); e2 = mean_emb(parts2[1])
+        if e1 is None or e2 is None:
+            return [comp_mask.astype(np.uint8)]
+        ed = float(np.linalg.norm(e1 - e2))
+        if ed < float(min_emb_dist):
+            return [comp_mask.astype(np.uint8)]
+
+        return parts2
+
+    # fallback guarded KMeans (rare)
+    idx = np.arange(area)
+    if area > max_samples:
+        idx = np.random.default_rng(seed).choice(idx, size=max_samples, replace=False)
+    ys_s = ys[idx]; xs_s = xs[idx]
+    X = emb[:, ys_s, xs_s].T
+
+    try:
+        km = KMeans(n_clusters=2, random_state=seed, n_init=10)
+        km.fit(X)
+        c0, c1 = km.cluster_centers_[0], km.cluster_centers_[1]
+        cent_dist = float(np.linalg.norm(c0 - c1))
+        if cent_dist < float(min_cent_dist):
+            return [comp_mask.astype(np.uint8)]
+
+        labels = km.predict(emb[:, ys, xs].T)
+    except Exception:
+        return [comp_mask.astype(np.uint8)]
+
+    m1 = np.zeros_like(comp_mask, dtype=np.uint8)
+    m2 = np.zeros_like(comp_mask, dtype=np.uint8)
+    m1[ys, xs] = (labels == 0).astype(np.uint8)
+    m2[ys, xs] = (labels == 1).astype(np.uint8)
+
+    if int(m1.sum()) < int(min_area) or int(m2.sum()) < int(min_area):
+        return [comp_mask.astype(np.uint8)]
+    if float(prob[m1 > 0].mean()) < float(min_mean_prob) or float(prob[m2 > 0].mean()) < float(min_mean_prob):
+        return [comp_mask.astype(np.uint8)]
+
+    e1 = emb[:, ys[m1[ys, xs] > 0], xs[m1[ys, xs] > 0]].T.mean(axis=0) if int(m1.sum()) > 0 else None
+    e2 = emb[:, ys[m2[ys, xs] > 0], xs[m2[ys, xs] > 0]].T.mean(axis=0) if int(m2.sum()) > 0 else None
+    if e1 is None or e2 is None:
+        return [comp_mask.astype(np.uint8)]
+    ed = float(np.linalg.norm(e1 - e2))
+    if ed < float(min_emb_dist):
+        return [comp_mask.astype(np.uint8)]
+
+    return [m1, m2]
+
+def extract_instances_from_mask(mask01: np.ndarray, prob: np.ndarray, emb: np.ndarray,
+                                enable_split: bool,
+                                seed: int,
+                                split_area_trigger: int,
+                                split_min_area: int,
+                                split_min_cent_dist: float,
+                                split_min_emb_dist: float,
+                                split_min_mean_prob: float,
+                                split_peak_q: float,
+                                split_min_peak_dist: int,
+                                split_min_peak_mean_prob: float,
+                                min_area_inst: int) -> List[np.ndarray]:
+    num, lab = connected_components(mask01.astype(np.uint8))
+    insts: List[np.ndarray] = []
+
+    for cid in range(1, num):
+        comp = (lab == cid).astype(np.uint8)
+        area = int(comp.sum())
+        if area < int(min_area_inst):
+            continue
+
+        masks = [comp]
+        if enable_split and area >= int(split_area_trigger):
+            masks = split_component_safely(
+                prob=prob,
+                emb=emb,
+                comp_mask=comp,
+                seed=seed,
+                min_area=int(split_min_area),
+                min_cent_dist=float(split_min_cent_dist),
+                min_emb_dist=float(split_min_emb_dist),
+                min_mean_prob=float(split_min_mean_prob),
+                peak_q=float(split_peak_q),
+                min_peak_dist=int(split_min_peak_dist),
+                min_peak_mean_prob=float(split_min_peak_mean_prob),
+            )
+
+        for m in masks:
+            if int(m.sum()) >= int(min_area_inst):
+                insts.append((m > 0).astype(np.uint8))
+    return insts
+
+def suppress_overlaps(insts: List[np.ndarray], prob: np.ndarray, min_area: int) -> List[np.ndarray]:
+    if len(insts) <= 1:
+        return insts
+    scored = []
+    for m in insts:
+        ys, xs = np.where(m > 0)
+        if len(xs) == 0:
+            continue
+        sc = float(prob[ys, xs].mean())
+        scored.append((sc, m))
+    scored.sort(key=lambda x: -x[0])
+
+    occ = np.zeros_like(prob, dtype=np.uint8)
+    kept = []
+    for sc, m in scored:
+        mm = (m > 0).astype(np.uint8)
+        mm = (mm & (occ == 0)).astype(np.uint8)
+        if int(mm.sum()) < int(min_area):
+            continue
+        occ[mm > 0] = 1
+        kept.append(mm)
+    return kept
+
+# ------------------------------
+# Logging
+# ------------------------------
+def setup_logger(run_dir: str) -> logging.Logger:
+    lg = logging.getLogger("ship")
+    lg.setLevel(logging.INFO)
+    lg.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    lg.addHandler(sh)
+
+    fh = logging.FileHandler(os.path.join(run_dir, "run.log"), mode="w")
+    fh.setFormatter(fmt)
+    lg.addHandler(fh)
+    return lg
+
+# ------------------------------
+# Main
+# ------------------------------
+def main():
+    args = build_argparser().parse_args()
+    seed_everything(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    data_dir = args.data_dir
+    train_csv = os.path.join(data_dir, "train_ship_segmentations_v2.csv")
+    sample_sub_csv = os.path.join(data_dir, "sample_submission_v2.csv")
+    train_img_dir = os.path.join(data_dir, "train_v2")
+    test_img_dir = os.path.join(data_dir, "test_v2")
+
+    for p in [train_csv, sample_sub_csv, train_img_dir, test_img_dir]:
+        if not os.path.exists(p):
+            raise RuntimeError(f"Missing path: {p}")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    run_name = time.strftime("run__%Y%m%d_%H%M%S") + f"__seed{args.seed}__tr{args.train_ratio:.2f}__tta{args.tta_mode}"
+    run_dir = os.path.join(args.out_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    logger = setup_logger(run_dir)
+    logger.info("=== ENV ===")
+    logger.info(f"device={device} torch={torch.__version__} torchvision={torchvision.__version__} CC_BACKEND={CC_BACKEND}")
+    logger.info(f"TTA(prob only) mode={args.tta_mode}  (emb is NOT averaged)")
+    logger.info("=== PATHS ===")
+    logger.info(f"data_dir={data_dir}")
+    logger.info(f"train_csv={train_csv}")
+    logger.info(f"sample_sub_csv={sample_sub_csv}")
+    logger.info(f"train_img_dir={train_img_dir}")
+    logger.info(f"test_img_dir={test_img_dir}")
+    logger.info(f"run_dir={run_dir}")
+
+    # read CSVs
+    logger.info("[CSV] reading train csv -> id2rles ...")
+    id2rles = read_train_csv_id2rles(train_csv)
+
+    all_train_ids = sorted([f for f in os.listdir(train_img_dir) if f.lower().endswith(".jpg")])
+    pos_ids = [i for i in all_train_ids if i in id2rles]
+    neg_ids = [i for i in all_train_ids if i not in id2rles]
+    logger.info(f"[DATA] ALL={len(all_train_ids)} pos={len(pos_ids)} neg={len(neg_ids)}")
+
+    # split
+    train_ids, rest_ids = stratified_split_ids(pos_ids, neg_ids, train_ratio=args.train_ratio, seed=args.seed)
+    val_seg_ids, val_tree_train_ids, val_tree_calib_ids = split_rest_three(rest_ids, seed=args.seed)
+    logger.info(f"[SPLIT] train={len(train_ids)} val_seg={len(val_seg_ids)} val_tree_train={len(val_tree_train_ids)} val_tree_calib={len(val_tree_calib_ids)}")
+
+    with open(os.path.join(run_dir, "split_ids.json"), "w") as f:
+        json.dump({
+            "seed": args.seed,
+            "train_ratio": args.train_ratio,
+            "train_ids": train_ids,
+            "val_seg_ids": val_seg_ids,
+            "val_tree_train_ids": val_tree_train_ids,
+            "val_tree_calib_ids": val_tree_calib_ids,
+            "data_dir": data_dir,
+            "tta_mode": args.tta_mode
+        }, f, indent=2)
+
+    cfg = Cfg(
+        train_size=args.train_size,
+        infer_size=args.infer_size,
+        num_workers=args.num_workers,
+        batch_train=args.batch_train,
+        batch_eval=args.batch_eval,
+        batch_tree=args.batch_tree,
+        batch_test=args.batch_test
+    )
+
+    # dataloaders
+    train_ds = AirbusTrainDataset(train_img_dir, train_ids, id2rles, out_size=cfg.train_size)
+    val_seg_ds = AirbusEvalDataset(train_img_dir, val_seg_ids, id2rles, out_size=cfg.train_size)
+    val_tree_train_ds = AirbusTrainDataset(train_img_dir, val_tree_train_ids, id2rles, out_size=cfg.train_size)
+    val_tree_calib_ds = AirbusTrainDataset(train_img_dir, val_tree_calib_ids, id2rles, out_size=cfg.train_size)
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_train, shuffle=True,
+                              num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
+    val_seg_loader = DataLoader(val_seg_ds, batch_size=cfg.batch_eval, shuffle=False,
+                                num_workers=cfg.num_workers, pin_memory=True)
+    val_tree_train_loader = DataLoader(val_tree_train_ds, batch_size=cfg.batch_tree, shuffle=False,
+                                       num_workers=cfg.num_workers, pin_memory=True)
+    val_tree_calib_loader = DataLoader(val_tree_calib_ds, batch_size=cfg.batch_tree, shuffle=False,
+                                       num_workers=cfg.num_workers, pin_memory=True)
+
+    logger.info(f"[DL] train_batches={len(train_loader)} val_seg_batches={len(val_seg_loader)} "
+                f"val_tree_train_batches={len(val_tree_train_loader)} val_tree_calib_batches={len(val_tree_calib_loader)}")
+
+    # pos_weight estimate
+    pos_ratio = estimate_pos_ratio_from_ids(train_ids, id2rles, H=IMG_H, W=IMG_W)
+    neg_ratio = 1.0 - pos_ratio
+    pos_weight = float(neg_ratio / max(pos_ratio, 1e-12))
+    pos_weight_clipped = float(np.clip(pos_weight, 1.0, 50.0))
+    logger.info(f"[POS] pos_ratio={pos_ratio:.6f} pos_weight(raw)={pos_weight:.2f} clipped={pos_weight_clipped:.2f}")
+
+    # model
+    try:
+        from torchvision.models import ResNet50_Weights
+        backbone_w = ResNet50_Weights.DEFAULT
+    except Exception:
+        backbone_w = None
+
+    base = torchvision.models.segmentation.deeplabv3_resnet50(
+        weights=None,
+        weights_backbone=backbone_w,
+        num_classes=2
+    )
+    model = DeepLabV3WithEmbedding(base, emb_dim=args.emb_dim).to(device)
+
+    # seg losses
+    ce_weight = torch.tensor([1.0, pos_weight_clipped], dtype=torch.float32, device=device)
+    ce_loss_fn = nn.CrossEntropyLoss(weight=ce_weight)
+    tversky_loss_fn = SoftTverskyLoss(alpha=args.tversky_alpha, beta=args.tversky_beta, smooth=1e-6)
+
+    def seg_loss_fn(logits2: torch.Tensor, target01: torch.Tensor) -> torch.Tensor:
+        y = target01.squeeze(1).long()
+        ce = ce_loss_fn(logits2, y)
+        probs = torch.softmax(logits2, dim=1)[:, 1:2, :, :]
+        tv = tversky_loss_fn(probs, target01)
+        return ce + args.tversky_lambda * tv
+
+    inst_loss_fn = DiscriminativeInstanceLoss(
+        delta_v=args.delta_v, delta_d=args.delta_d,
+        alpha=args.inst_alpha, beta=args.inst_beta, gamma=args.inst_gamma,
+        max_points_per_inst=args.inst_max_points
+    )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+
+    thr_grid = np.linspace(args.thr_min, args.thr_max, args.thr_steps).astype(np.float32)
+
+    # train loop
+    best_val = -1.0
+    best_epoch = -1
+    best_thr = 0.5
+    pat = 0
+
+    ckpt_path = os.path.join(run_dir, "best_ckpt.pt")
+    meta_train_path = os.path.join(run_dir, "meta_train.json")
+    hist = []
+
+    logger.info("[START] Training...")
+    for epoch in range(1, args.max_epochs + 1):
+        model.train()
+        running = 0.0
+        nstep = 0
+        t0 = time.time()
+
+        for it, batch in enumerate(train_loader):
+            _, x, y_sem, y_inst = batch
+            x = x.to(device, non_blocking=True)
+            y_sem = y_sem.to(device, non_blocking=True)
+            y_inst = y_inst.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            out = model(x)
+            logits = out["seg"]
+            emb = out["emb"]
+
+            loss_seg = seg_loss_fn(logits, y_sem)
+            loss_inst = inst_loss_fn(emb, y_inst)
+            loss = loss_seg + args.lambda_inst * loss_inst
+
+            loss.backward()
+            if args.clip_grad > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad)
+            optimizer.step()
+
+            running += float(loss.item())
+            nstep += 1
+
+            if (it + 1) % 50 == 0:
+                dt = time.time() - t0
+                logger.info(f"[TRAIN] epoch={epoch} it={it+1}/{len(train_loader)} "
+                            f"loss_avg={running/max(nstep,1):.4f} seg={float(loss_seg.item()):.4f} inst={float(loss_inst.item()):.4f} t={dt:.1f}s")
+
+        tr_loss = running / max(nstep, 1)
+        thr, val_f = compute_best_thr_fbeta(model, val_seg_loader, device=device, beta=args.beta_f, thr_grid=thr_grid, tta_mode=args.tta_mode)
+        logger.info(f"[VAL] epoch={epoch} train_loss={tr_loss:.4f} best_thr={thr:.3f} val_fbeta={val_f:.5f}")
+
+        hist.append({"epoch": epoch, "train_loss": tr_loss, "best_thr": thr, "val_fbeta": val_f})
+
+        if val_f > best_val:
+            best_val = val_f
+            best_epoch = epoch
+            best_thr = thr
+            pat = 0
+            torch.save(model.state_dict(), ckpt_path)
+            with open(meta_train_path, "w") as f:
+                json.dump({
+                    "seed": args.seed,
+                    "train_ratio": args.train_ratio,
+                    "train_size": args.train_size,
+                    "infer_size": args.infer_size,
+                    "pos_ratio_est": pos_ratio,
+                    "pos_weight_clipped": pos_weight_clipped,
+                    "lr": args.lr,
+                    "wd": args.wd,
+                    "tversky_lambda": args.tversky_lambda,
+                    "tversky_alpha": args.tversky_alpha,
+                    "tversky_beta": args.tversky_beta,
+                    "lambda_inst": args.lambda_inst,
+                    "emb_dim": args.emb_dim,
+                    "delta_v": args.delta_v,
+                    "delta_d": args.delta_d,
+                    "best_epoch": best_epoch,
+                    "best_thr": best_thr,
+                    "best_val_fbeta": best_val,
+                    "max_epochs": args.max_epochs,
+                    "patience": args.patience,
+                    "beta_f": args.beta_f,
+                    "tta_mode": args.tta_mode,
+                    "history": hist
+                }, f, indent=2)
+            logger.info(f"[CKPT] saved: {ckpt_path}")
+        else:
+            pat += 1
+            logger.info(f"[ES] no improve patience {pat}/{args.patience}")
+            if pat >= args.patience:
+                logger.info("[ES] early stop.")
+                break
+
+    # load best
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.eval()
+    logger.info(f"[DONE] Loaded best ckpt. best_epoch={best_epoch} best_thr={best_thr} best_val_fbeta={best_val}")
+
+    # ------------------------------
+    # Pixel-wise tree training
+    # ------------------------------
+    proposal_thr = float(np.clip(best_thr * args.prop_mult, 0.01, 0.99))
+    logger.info(f"[PROP] best_thr={best_thr:.3f} prop_mult={args.prop_mult:.3f} proposal_thr={proposal_thr:.3f}")
+
+    rng = np.random.default_rng(args.seed)
+    X_list = []
+    y_list = []
+    total_pix = 0
+
+    logger.info("[TREE] collecting pixel samples from val_tree_train...")
+    for bi, batch in enumerate(val_tree_train_loader):
+        _, x_b, y_sem_b, _ = batch
+        x_b = x_b.to(device, non_blocking=True)
+
+        # prob: TTA / emb: no-tta
+        prob_b = forward_prob_tta(model, x_b, tta_mode=args.tta_mode)      # [N,1,H,W]
+        emb_b = forward_emb_no_tta(model, x_b)                              # [N,D,H,W]
+        gt_b = y_sem_b.numpy()
+
+        N = prob_b.shape[0]
+        for i in range(N):
+            prob = prob_b[i, 0].astype(np.float32)
+            emb = emb_b[i].astype(np.float32)
+            gt = (gt_b[i, 0] > 0.5).astype(np.uint8)
+
+            cand_area = int((prob >= proposal_thr).sum())
+            if cand_area < args.pix_min_cand_area:
+                continue
+
+            ys, xs = sample_pixels_for_tree(
+                prob=prob, gt=gt, proposal_thr=proposal_thr,
+                pos_per_img=args.pix_pos_per_img, neg_per_img=args.pix_neg_per_img,
+                rng=rng
+            )
+            if len(xs) == 0:
+                continue
+
+            Xpix = build_pixel_features(prob, emb, ys, xs)
+            ypix = gt[ys, xs].astype(np.uint8)
+
+            X_list.append(Xpix)
+            y_list.append(ypix)
+
+            total_pix += int(len(xs))
+            if total_pix >= args.pix_max_total:
+                break
+
+        if total_pix >= args.pix_max_total:
+            break
+
+        if (bi + 1) % 50 == 0:
+            logger.info(f"[TREE] batch {bi+1}/{len(val_tree_train_loader)} total_pix={total_pix}")
+            gc.collect()
+
+    if len(X_list) == 0:
+        raise RuntimeError("No pixel samples collected for tree training. Lower proposal_thr/prop_mult or increase sampling.")
+
+    X = np.concatenate(X_list, axis=0).astype(np.float32)
+    y = np.concatenate(y_list, axis=0).astype(np.int64)
+    pos_cnt = int((y == 1).sum())
+    neg_cnt = int((y == 0).sum())
+    logger.info(f"[TREE] pixel dataset X={X.shape} pos={pos_cnt} neg={neg_cnt}")
+
+    if pos_cnt <= 0:
+        logger.info("[WARN] No positive pixels sampled for tree. Consider lowering proposal_thr.")
+    pos_cnt = max(pos_cnt, 1)
+    neg_cnt = max(neg_cnt, 1)
+
+    w_pos = neg_cnt / (pos_cnt + 1e-9)
+    sample_weight = np.where(y == 1, w_pos, 1.0).astype(np.float32)
+
+    tree = HistGradientBoostingClassifier(
+        learning_rate=args.tree_lr,
+        max_depth=args.tree_max_depth,
+        max_iter=args.tree_max_iter,
+        random_state=args.seed
+    )
+    tree.fit(X, y, sample_weight=sample_weight)
+
+    # save tree
+    try:
+        import joblib
+        tree_path = os.path.join(run_dir, "tree_pix_hgbdt.pkl")
+        joblib.dump(tree, tree_path)
+        logger.info(f"[TREE] saved: {tree_path}")
+    except Exception as e:
+        logger.info(f"[TREE] joblib save failed: {repr(e)}")
+
+    # ------------------------------
+    # Calibrate tree_thr (+ optional postprocess)
+    # ------------------------------
+    logger.info("[CALIB] searching tree_thr on val_tree_calib...")
+
+    enable_split = (not bool(args.disable_emb_split))
+
+    open_list = _parse_int_list(args.pp_open_list)
+    close_list = _parse_int_list(args.pp_close_list)
+    min_area_list = _parse_int_list(args.pp_min_area_list)
+    merge_ks_list = _parse_int_list(args.pp_merge_ks_list)
+    merge_iters_list = _parse_int_list(args.pp_merge_iters_list)
+    bridge_thr_list = _parse_float_list(args.pp_bridge_thr_list)
+
+    if not args.search_postprocess:
+        open_list = [0]
+        close_list = [0]
+        min_area_list = [0]
+        merge_ks_list = [0]
+        merge_iters_list = [0]
+        bridge_thr_list = [0.0]
+
+    @torch.no_grad()
+    def eval_setting(tree_thr: float, pp: Dict[str, Any]) -> float:
+        scores = []
+        for batch in val_tree_calib_loader:
+            _, x_b, y_sem_b, _ = batch
+            x_b = x_b.to(device, non_blocking=True)
+
+            prob_b = forward_prob_tta(model, x_b, tta_mode=args.tta_mode)
+            emb_b  = forward_emb_no_tta(model, x_b)
+            gt_b = y_sem_b.numpy()
+
+            N = prob_b.shape[0]
+            for i in range(N):
+                prob = prob_b[i, 0].astype(np.float32)
+                emb  = emb_b[i].astype(np.float32)
+                gt = (gt_b[i, 0] > 0.5).astype(np.uint8)
+
+                refined = apply_pixel_tree(prob, emb, proposal_thr=proposal_thr, tree=tree, tree_thr=tree_thr)
+                refined = postprocess_mask(
+                    refined, prob,
+                    open_iters=int(pp["open"]),
+                    close_ks=int(pp["close"]),
+                    min_area=int(pp["min_area"]),
+                    merge_ks=int(pp["merge_ks"]),
+                    merge_iters=int(pp["merge_iters"]),
+                    bridge_thr=float(pp["bridge_thr"]),
+                )
+                scores.append(pixel_fbeta(refined, gt, beta=args.beta_f))
+
+        return float(np.mean(scores)) if len(scores) > 0 else 0.0
+
+    best_tree_thr = 0.5
+    best_pp = {"open": 0, "close": 0, "min_area": 0, "merge_ks": 0, "merge_iters": 0, "bridge_thr": 0.0}
+    best_score = -1.0
+
+    for t in thr_grid:
+        for op in open_list:
+            for ck in close_list:
+                for ma in min_area_list:
+                    for mk in merge_ks_list:
+                        for mi in merge_iters_list:
+                            for bt in bridge_thr_list:
+                                pp = {"open": op, "close": ck, "min_area": ma, "merge_ks": mk, "merge_iters": mi, "bridge_thr": bt}
+                                sc = eval_setting(float(t), pp)
+                                logger.info(f"[CALIB] thr={float(t):.3f} pp={pp} mean_fbeta={sc:.6f}")
+                                if sc > best_score:
+                                    best_score = sc
+                                    best_tree_thr = float(t)
+                                    best_pp = pp
+
+    logger.info(f"[CALIB] best_tree_thr={best_tree_thr:.3f} best_pp={best_pp} best_score={best_score:.6f}")
+
+    with open(os.path.join(run_dir, "meta_tree.json"), "w") as f:
+        json.dump({
+            "proposal_thr": proposal_thr,
+            "prop_mult": args.prop_mult,
+            "tree_thr_grid": thr_grid.tolist(),
+            "best_tree_thr": best_tree_thr,
+            "best_tree_score": best_score,
+            "postprocess_search": bool(args.search_postprocess),
+            "best_postprocess": best_pp,
+            "pix_pos_per_img": args.pix_pos_per_img,
+            "pix_neg_per_img": args.pix_neg_per_img,
+            "pix_max_total": args.pix_max_total,
+            "tree_lr": args.tree_lr,
+            "tree_max_depth": args.tree_max_depth,
+            "tree_max_iter": args.tree_max_iter,
+            "enable_split_default_on": True,
+            "disable_emb_split_flag": bool(args.disable_emb_split),
+            "tta_mode": args.tta_mode,
+            "split_params": {
+                "split_area_trigger": args.split_area_trigger,
+                "split_min_area": args.split_min_area,
+                "split_min_peak_dist": args.split_min_peak_dist,
+                "split_peak_q": args.split_peak_q,
+                "split_min_peak_mean_prob": args.split_min_peak_mean_prob,
+                "split_min_cent_dist": args.split_min_cent_dist,
+                "split_min_emb_dist": args.split_min_emb_dist,
+                "split_min_mean_prob": args.split_min_mean_prob,
+            },
+            "min_area_inst": args.min_area_inst
+        }, f, indent=2)
+
+    # ------------------------------
+    # Test inference -> variable-row submission
+    # ------------------------------
+    try:
+        test_ids_template = read_sample_submission_ids(sample_sub_csv)
+        if len(test_ids_template) > 0:
+            test_ids = test_ids_template
+            logger.info(f"[TEST] using sample_submission order: {len(test_ids)}")
+        else:
+            raise RuntimeError("Empty sample_submission ids")
+    except Exception as e:
+        logger.info(f"[TEST] fallback to directory listing due to: {repr(e)}")
+        test_ids = sorted([f for f in os.listdir(test_img_dir) if f.lower().endswith(".jpg")])
+
+    test_loader = DataLoader(
+        TestDataset(test_img_dir, test_ids, out_size=args.infer_size),
+        batch_size=args.batch_test,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+
+    sub_path = os.path.join(run_dir, "submission_instances.csv")
+    logger.info(f"[INFER] generating submission: {sub_path}")
+    logger.info(f"[INFER] enable_split(default ON)={enable_split} (disable_emb_split={args.disable_emb_split})")
+    logger.info(f"[INFER] applying best_pp={best_pp}")
+    logger.info(f"[INFER] tta_mode(prob only)={args.tta_mode}")
+
+    rows: List[Tuple[str, str]] = []
+
+    t0 = time.time()
+    for bi, batch in enumerate(test_loader):
+        ids_b, x_b = batch
+        x_b = x_b.to(device, non_blocking=True)
+
+        prob_b = forward_prob_tta(model, x_b, tta_mode=args.tta_mode)
+        emb_b  = forward_emb_no_tta(model, x_b)
+
+        N = prob_b.shape[0]
+        for i in range(N):
+            img_id = ids_b[i]
+            prob = prob_b[i, 0].astype(np.float32)
+            emb  = emb_b[i].astype(np.float32)
+
+            refined = apply_pixel_tree(prob, emb, proposal_thr=proposal_thr, tree=tree, tree_thr=best_tree_thr)
+            refined = postprocess_mask(
+                refined, prob,
+                open_iters=int(best_pp["open"]),
+                close_ks=int(best_pp["close"]),
+                min_area=int(best_pp["min_area"]),
+                merge_ks=int(best_pp["merge_ks"]),
+                merge_iters=int(best_pp["merge_iters"]),
+                bridge_thr=float(best_pp["bridge_thr"]),
+            )
+
+            insts = extract_instances_from_mask(
+                mask01=refined,
+                prob=prob,
+                emb=emb,
+                enable_split=enable_split,
+                seed=args.seed,
+                split_area_trigger=args.split_area_trigger,
+                split_min_area=args.split_min_area,
+                split_min_cent_dist=args.split_min_cent_dist,
+                split_min_emb_dist=args.split_min_emb_dist,
+                split_min_mean_prob=args.split_min_mean_prob,
+                split_peak_q=args.split_peak_q,
+                split_min_peak_dist=args.split_min_peak_dist,
+                split_min_peak_mean_prob=args.split_min_peak_mean_prob,
+                min_area_inst=args.min_area_inst
+            )
+            insts = suppress_overlaps(insts, prob=prob, min_area=args.min_area_inst)
+
+            if len(insts) == 0:
+                rows.append((img_id, ""))
+            else:
+                for m in insts:
+                    rows.append((img_id, rle_encode(m)))
+
+        if (bi + 1) % 200 == 0:
+            dt = time.time() - t0
+            logger.info(f"[INFER] {bi+1}/{len(test_loader)} rows={len(rows)} time={dt/60:.1f} min")
+            gc.collect()
+
+    with open(sub_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ImageId", "EncodedPixels"])
+        for img_id, enc in rows:
+            w.writerow([img_id, enc])
+
+    non_empty = sum(1 for _, enc in rows if isinstance(enc, str) and len(enc) > 0)
+    logger.info(f"[DONE] saved: {sub_path}")
+    logger.info(f"[DONE] rows: {len(rows)} non-empty: {non_empty}")
+    logger.info(f"[DONE] run_dir: {run_dir}")
+    logger.info(f"[DONE] proposal_thr: {proposal_thr:.3f} best_tree_thr: {best_tree_thr:.3f} best_score: {best_score:.6f}")
+
+if __name__ == "__main__":
+    main()
