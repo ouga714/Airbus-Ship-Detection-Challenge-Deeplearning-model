@@ -1,0 +1,1273 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+unet768_aug_thr_postsearch_instances.py
+
+Single-file end-to-end pipeline for Kaggle Airbus Ship Detection:
+- Builds ALL_TRAIN_IDS from train_v2 directory (includes ship-negative).
+- Stratified training sampling with pos:neg = pos_frac:(1-pos_frac).
+- Pos images are weighted to emphasize:
+    * many instances
+    * many small instances
+  using RLE area computed without full decode.
+- Trains a lightweight U-Net (GroupNorm) at 768x768 with FP32 (no AMP).
+- Uses augmentation (flip/rot90/brightness-contrast/gamma/noise/blur/optional CLAHE).
+- After training, performs grid search for:
+    * seg_thr
+    * postprocess params (open/close/min_area/merge)
+  on val_seg.
+- Inference on test_v2 and outputs instance-per-row submission.csv
+  (ImageId can repeat, each instance separate RLE; if no ship, emit empty RLE row).
+- Writes logs, metrics, splits, config, best params to run directory.
+
+Designed for "momos" style environment (e.g., /workspace/kaggle_competition/...).
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import math
+import random
+import logging
+import argparse
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# Optional OpenCV for morphology/CLAHE/connected components
+HAS_CV2 = False
+try:
+    import cv2
+    HAS_CV2 = True
+except Exception:
+    HAS_CV2 = False
+
+
+# -------------------------
+# Utilities
+# -------------------------
+
+def now_str() -> str:
+    return time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def save_json(path: str, obj) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def load_image_rgb(path: str) -> Image.Image:
+    img = Image.open(path).convert("RGB")
+    return img
+
+def pil_to_np_uint8(img: Image.Image) -> np.ndarray:
+    return np.array(img, dtype=np.uint8)
+
+def resize_np(img: np.ndarray, size: int, is_mask: bool = False) -> np.ndarray:
+    if HAS_CV2:
+        interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_LINEAR
+        return cv2.resize(img, (size, size), interpolation=interp)
+    # PIL fallback
+    pil = Image.fromarray(img)
+    resample = Image.NEAREST if is_mask else Image.BILINEAR
+    pil = pil.resize((size, size), resample=resample)
+    return np.array(pil, dtype=img.dtype)
+
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+def safe_mean(xs: List[float]) -> float:
+    if not xs:
+        return 0.0
+    return float(sum(xs) / max(1, len(xs)))
+
+
+# -------------------------
+# RLE (Kaggle Airbus)
+# -------------------------
+
+def rle_decode_to_mask(rle: str, h: int, w: int) -> np.ndarray:
+    """
+    Decode Airbus RLE (1-indexed, column-major) into (h,w) uint8 mask {0,1}.
+    """
+    if rle is None or rle == "":
+        return np.zeros((h, w), dtype=np.uint8)
+    s = rle.strip().split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    img = np.zeros(h * w, dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        img[lo:hi] = 1
+    # column-major
+    return img.reshape((w, h)).T
+
+def mask_to_rle(mask: np.ndarray) -> str:
+    """
+    Encode (h,w) mask {0,1} to Airbus RLE (column-major, 1-indexed).
+    """
+    if mask is None:
+        return ""
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    if mask.max() == 0:
+        return ""
+    h, w = mask.shape
+    pixels = mask.T.flatten()  # column-major
+    # pad with zeros at ends
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[0::2]
+    return " ".join(str(x) for x in runs)
+
+def rle_area_fast(rle: str) -> int:
+    """
+    Compute area (#ones) from RLE without decoding full mask.
+    """
+    if rle is None or rle == "":
+        return 0
+    s = rle.strip().split()
+    lengths = s[1::2]
+    # sum lengths
+    total = 0
+    for ln in lengths:
+        total += int(ln)
+    return total
+
+
+# -------------------------
+# CSV loading
+# -------------------------
+
+def read_train_csv_id2rles(csv_path: str) -> Dict[str, List[str]]:
+    """
+    Returns dict: ImageId -> list of RLEs (positive only).
+    CSV: ImageId, EncodedPixels (empty means no ship, but typically absent rows for negatives in v2).
+    """
+    id2rles: Dict[str, List[str]] = {}
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            img_id = row["ImageId"]
+            rle = row["EncodedPixels"]
+            if rle is None or rle == "":
+                continue
+            if img_id not in id2rles:
+                id2rles[img_id] = []
+            id2rles[img_id].append(rle)
+    return id2rles
+
+def list_dir_image_ids(img_dir: str) -> List[str]:
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+    ids = []
+    for name in os.listdir(img_dir):
+        if name.lower().endswith(exts):
+            ids.append(name)
+    ids.sort()
+    return ids
+
+def read_sample_submission_ids(sample_csv: str) -> List[str]:
+    ids = []
+    with open(sample_csv, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ids.append(row["ImageId"])
+    return ids
+
+
+# -------------------------
+# Augmentation (numpy uint8, mask uint8)
+# -------------------------
+
+@dataclass
+class AugConfig:
+    p_hflip: float = 0.5
+    p_vflip: float = 0.5
+    p_rot90: float = 0.5
+    p_bc: float = 0.5
+    bc_brightness: float = 0.15
+    bc_contrast: float = 0.15
+    p_gamma: float = 0.3
+    gamma_range: Tuple[float, float] = (0.85, 1.15)
+    p_noise: float = 0.25
+    noise_std: float = 6.0
+    p_blur: float = 0.2
+    blur_ks: int = 3
+    p_clahe: float = 0.15
+    clahe_clip: float = 2.0
+    clahe_grid: int = 8
+    p_cutout: float = 0.1
+    cutout_frac: float = 0.08
+
+def aug_apply(img: np.ndarray, mask: np.ndarray, cfg: AugConfig, rng: random.Random) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    img: (H,W,3) uint8, mask: (H,W) uint8 {0,1}
+    """
+    assert img.dtype == np.uint8 and mask.dtype == np.uint8
+
+    # flips
+    if rng.random() < cfg.p_hflip:
+        img = img[:, ::-1, :]
+        mask = mask[:, ::-1]
+    if rng.random() < cfg.p_vflip:
+        img = img[::-1, :, :]
+        mask = mask[::-1, :]
+
+    # rot90
+    if rng.random() < cfg.p_rot90:
+        k = rng.randint(0, 3)
+        if k > 0:
+            img = np.rot90(img, k, axes=(0, 1)).copy()
+            mask = np.rot90(mask, k, axes=(0, 1)).copy()
+
+    # brightness/contrast
+    if rng.random() < cfg.p_bc:
+        b = (rng.random() * 2 - 1) * cfg.bc_brightness
+        c = 1.0 + (rng.random() * 2 - 1) * cfg.bc_contrast
+        x = img.astype(np.float32) / 255.0
+        x = x * c + b
+        x = np.clip(x, 0.0, 1.0)
+        img = (x * 255.0).astype(np.uint8)
+
+    # gamma
+    if rng.random() < cfg.p_gamma:
+        g = rng.uniform(cfg.gamma_range[0], cfg.gamma_range[1])
+        x = img.astype(np.float32) / 255.0
+        x = np.power(x, g)
+        x = np.clip(x, 0.0, 1.0)
+        img = (x * 255.0).astype(np.uint8)
+
+    # noise
+    if rng.random() < cfg.p_noise:
+        noise = rng.normalvariate(0.0, cfg.noise_std)
+        n = np.random.normal(0.0, cfg.noise_std, size=img.shape).astype(np.float32)
+        x = img.astype(np.float32) + n
+        img = np.clip(x, 0.0, 255.0).astype(np.uint8)
+
+    # blur
+    if rng.random() < cfg.p_blur:
+        if HAS_CV2:
+            k = max(1, int(cfg.blur_ks))
+            if k % 2 == 0:
+                k += 1
+            img = cv2.GaussianBlur(img, (k, k), 0)
+        else:
+            # very light fallback: box blur via PIL
+            pil = Image.fromarray(img)
+            pil = pil.filter(Image.Filter.BLUR)  # may be unavailable in some PIL builds
+            img = np.array(pil, dtype=np.uint8)
+
+    # CLAHE (only if cv2)
+    if HAS_CV2 and (rng.random() < cfg.p_clahe):
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=float(cfg.clahe_clip), tileGridSize=(int(cfg.clahe_grid), int(cfg.clahe_grid)))
+        l2 = clahe.apply(l)
+        lab2 = cv2.merge([l2, a, b])
+        img = cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB)
+
+    # cutout (weak; avoid erasing too much)
+    if rng.random() < cfg.p_cutout:
+        h, w, _ = img.shape
+        frac = float(cfg.cutout_frac)
+        ch = max(1, int(h * frac))
+        cw = max(1, int(w * frac))
+        y0 = rng.randint(0, max(0, h - ch))
+        x0 = rng.randint(0, max(0, w - cw))
+        img[y0:y0+ch, x0:x0+cw, :] = 0
+
+    return img, mask
+
+
+# -------------------------
+# Dataset
+# -------------------------
+
+class ShipSegDataset(Dataset):
+    def __init__(
+        self,
+        ids: List[str],
+        img_dir: str,
+        id2rles: Dict[str, List[str]],
+        size: int = 768,
+        augment: bool = False,
+        aug_cfg: Optional[AugConfig] = None,
+        seed: int = 42,
+    ):
+        self.ids = ids
+        self.img_dir = img_dir
+        self.id2rles = id2rles
+        self.size = int(size)
+        self.augment = bool(augment)
+        self.aug_cfg = aug_cfg if aug_cfg is not None else AugConfig()
+        self.rng = random.Random(seed)
+
+        # ImageNet mean/std (float)
+        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self.std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def __getitem__(self, idx: int):
+        img_id = self.ids[idx]
+        path = os.path.join(self.img_dir, img_id)
+        img_pil = load_image_rgb(path)
+        img = pil_to_np_uint8(img_pil)  # H,W,3
+
+        # build mask from RLE(s) if any
+        rles = self.id2rles.get(img_id, [])
+        if len(rles) == 0:
+            mask = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
+        else:
+            h, w = img.shape[0], img.shape[1]
+            mask = np.zeros((h, w), dtype=np.uint8)
+            for rle in rles:
+                mask |= rle_decode_to_mask(rle, h, w)
+
+        # resize to size
+        if img.shape[0] != self.size or img.shape[1] != self.size:
+            img = resize_np(img, self.size, is_mask=False)
+            mask = resize_np(mask, self.size, is_mask=True)
+
+        # augment
+        if self.augment:
+            img, mask = aug_apply(img, mask, self.aug_cfg, self.rng)
+
+        # to tensor
+        x = img.astype(np.float32) / 255.0
+        x = (x - self.mean) / self.std
+        x = np.transpose(x, (2, 0, 1))  # C,H,W
+
+        y = mask.astype(np.float32)[None, :, :]  # 1,H,W
+        return torch.from_numpy(x), torch.from_numpy(y), img_id
+
+
+# -------------------------
+# U-Net (GroupNorm)
+# -------------------------
+
+class ConvGNReLU(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, gn_groups: int = 8):
+        super().__init__()
+        g = min(gn_groups, out_ch)
+        if out_ch % g != 0:
+            # fallback to 1 group
+            g = 1
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(g, out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(g, out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+class UNetGN(nn.Module):
+    def __init__(self, in_ch: int = 3, base: int = 24):
+        super().__init__()
+        c1 = base
+        c2 = base * 2
+        c3 = base * 4
+        c4 = base * 8
+        c5 = base * 16
+
+        self.enc1 = ConvGNReLU(in_ch, c1)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = ConvGNReLU(c1, c2)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = ConvGNReLU(c2, c3)
+        self.pool3 = nn.MaxPool2d(2)
+        self.enc4 = ConvGNReLU(c3, c4)
+        self.pool4 = nn.MaxPool2d(2)
+
+        self.bottleneck = ConvGNReLU(c4, c5)
+
+        self.up4 = nn.ConvTranspose2d(c5, c4, kernel_size=2, stride=2)
+        self.dec4 = ConvGNReLU(c4 + c4, c4)
+        self.up3 = nn.ConvTranspose2d(c4, c3, kernel_size=2, stride=2)
+        self.dec3 = ConvGNReLU(c3 + c3, c3)
+        self.up2 = nn.ConvTranspose2d(c3, c2, kernel_size=2, stride=2)
+        self.dec2 = ConvGNReLU(c2 + c2, c2)
+        self.up1 = nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2)
+        self.dec1 = ConvGNReLU(c1 + c1, c1)
+
+        self.out_conv = nn.Conv2d(c1, 1, kernel_size=1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+        e4 = self.enc4(self.pool3(e3))
+        b  = self.bottleneck(self.pool4(e4))
+
+        d4 = self.up4(b)
+        d4 = torch.cat([d4, e4], dim=1)
+        d4 = self.dec4(d4)
+
+        d3 = self.up3(d4)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+
+        logits = self.out_conv(d1)
+        return logits
+
+
+# -------------------------
+# Losses / Metrics
+# -------------------------
+
+def soft_dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    logits: (B,1,H,W), target: (B,1,H,W) float in {0,1}
+    """
+    prob = torch.sigmoid(logits)
+    num = 2.0 * (prob * target).sum(dim=(2, 3)) + eps
+    den = (prob + target).sum(dim=(2, 3)) + eps
+    dice = num / den
+    return 1.0 - dice.mean()
+
+def pixel_fbeta_from_logits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    thr: float,
+    beta: float = 2.0,
+    eps: float = 1e-9,
+) -> Tuple[float, float, float, float]:
+    """
+    Returns (precision, recall, fbeta, iou) on pixel-level.
+    """
+    prob = torch.sigmoid(logits)
+    pred = (prob >= thr).float()
+    t = target.float()
+
+    tp = (pred * t).sum().item()
+    fp = (pred * (1.0 - t)).sum().item()
+    fn = ((1.0 - pred) * t).sum().item()
+
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    bb = beta * beta
+    fbeta = (1.0 + bb) * precision * recall / (bb * precision + recall + eps)
+
+    iou = tp / (tp + fp + fn + eps)
+    return float(precision), float(recall), float(fbeta), float(iou)
+
+
+# -------------------------
+# Postprocess (rule-based mask shaping)
+# -------------------------
+
+@dataclass
+class PostCfg:
+    open_k: int = 0
+    close_k: int = 9
+    min_area: int = 60
+    merge_k: int = 9
+    merge_iters: int = 1
+
+def postprocess_mask(mask01: np.ndarray, cfg: PostCfg) -> np.ndarray:
+    """
+    mask01: uint8 {0,1} shape (H,W)
+    Apply morphology open/close + remove small objects + merge.
+    """
+    m = (mask01 > 0).astype(np.uint8)
+    if not HAS_CV2:
+        # Minimal fallback: only min_area via connected components if possible not available -> just return.
+        return m
+
+    H, W = m.shape
+
+    # open
+    if cfg.open_k and cfg.open_k > 0:
+        k = int(cfg.open_k)
+        if k % 2 == 0:
+            k += 1
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, ker)
+
+    # close
+    if cfg.close_k and cfg.close_k > 0:
+        k = int(cfg.close_k)
+        if k % 2 == 0:
+            k += 1
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, ker)
+
+    # remove small objects
+    if cfg.min_area and cfg.min_area > 0:
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        out = np.zeros_like(m)
+        for i in range(1, num):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area >= int(cfg.min_area):
+                out[labels == i] = 1
+        m = out
+
+    # merge nearby components (closing repeated)
+    if cfg.merge_k and cfg.merge_k > 0 and cfg.merge_iters and cfg.merge_iters > 0:
+        k = int(cfg.merge_k)
+        if k % 2 == 0:
+            k += 1
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        for _ in range(int(cfg.merge_iters)):
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, ker)
+
+    return m.astype(np.uint8)
+
+def mask_to_instances(mask01: np.ndarray) -> List[np.ndarray]:
+    """
+    Split binary mask into connected component instance masks.
+    Returns list of uint8 {0,1} instance masks.
+    """
+    m = (mask01 > 0).astype(np.uint8)
+    if not HAS_CV2:
+        # Fallback: single instance (no split)
+        if m.max() == 0:
+            return []
+        return [m]
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    insts = []
+    for i in range(1, num):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area <= 0:
+            continue
+        inst = (labels == i).astype(np.uint8)
+        insts.append(inst)
+    return insts
+
+
+# -------------------------
+# Splitting / Sampling
+# -------------------------
+
+def build_pos_neg_ids(all_ids: List[str], id2rles: Dict[str, List[str]]) -> Tuple[List[str], List[str]]:
+    pos = []
+    neg = []
+    for img_id in all_ids:
+        if img_id in id2rles and len(id2rles[img_id]) > 0:
+            pos.append(img_id)
+        else:
+            neg.append(img_id)
+    return pos, neg
+
+def compute_pos_weights(
+    pos_ids: List[str],
+    id2rles: Dict[str, List[str]],
+    small_area_thr: int,
+    w_inst: float,
+    w_small: float
+) -> List[float]:
+    """
+    Weight positive images by (1 + w_inst*num_instances + w_small*num_small_instances).
+    Areas computed from RLE lengths (fast).
+    """
+    ws = []
+    for img_id in pos_ids:
+        rles = id2rles.get(img_id, [])
+        n_inst = len(rles)
+        n_small = 0
+        for rle in rles:
+            a = rle_area_fast(rle)
+            if a <= small_area_thr:
+                n_small += 1
+        w = 1.0 + w_inst * float(n_inst) + w_small * float(n_small)
+        ws.append(w)
+    return ws
+
+def weighted_sample_without_replacement(items: List[str], weights: List[float], k: int, seed: int) -> List[str]:
+    """
+    Weighted sampling without replacement (approx) using Efraimidis-Spirakis.
+    """
+    rng = random.Random(seed)
+    assert len(items) == len(weights)
+    keys = []
+    for it, w in zip(items, weights):
+        u = rng.random()
+        w = max(1e-9, float(w))
+        key = u ** (1.0 / w)
+        keys.append((key, it))
+    keys.sort(reverse=True, key=lambda x: x[0])
+    return [it for _, it in keys[:k]]
+
+def split_train_val_pools(
+    all_ids: List[str],
+    seed: int,
+    train_ratio: float = 0.70,
+) -> Tuple[List[str], List[str]]:
+    """
+    Simple shuffle split: train and rest.
+    """
+    rng = random.Random(seed)
+    ids = list(all_ids)
+    rng.shuffle(ids)
+    n = len(ids)
+    n_train = int(n * train_ratio)
+    train_ids = ids[:n_train]
+    rest_ids = ids[n_train:]
+    return train_ids, rest_ids
+
+def split_rest_into_three(rest_ids: List[str], seed: int) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Split rest into three equal pools: val_seg, val_tree_train, val_tree_calib.
+    """
+    rng = random.Random(seed + 999)
+    ids = list(rest_ids)
+    rng.shuffle(ids)
+    n = len(ids)
+    a = n // 3
+    b = (2 * n) // 3
+    return ids[:a], ids[a:b], ids[b:]
+
+
+# -------------------------
+# Training / Eval
+# -------------------------
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    opt: torch.optim.Optimizer,
+    device: torch.device,
+    bce_weight: float,
+    dice_weight: float,
+    pos_weight: Optional[float],
+    grad_accum: int,
+    log_every: int,
+    logger: logging.Logger,
+) -> Dict[str, float]:
+    model.train()
+    t0 = time.time()
+
+    if pos_weight is not None and pos_weight > 0:
+        bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
+    else:
+        bce = nn.BCEWithLogitsLoss()
+
+    opt.zero_grad(set_to_none=True)
+
+    losses = []
+    losses_bce = []
+    losses_dice = []
+
+    step = 0
+    for it, batch in enumerate(loader):
+        x, y, _ = batch
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        logits = model(x)
+        loss_b = bce(logits, y)
+        loss_d = soft_dice_loss(logits, y)
+        loss = bce_weight * loss_b + dice_weight * loss_d
+        loss = loss / max(1, grad_accum)
+        loss.backward()
+
+        if (it + 1) % max(1, grad_accum) == 0:
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+
+        losses.append(float(loss.item() * max(1, grad_accum)))
+        losses_bce.append(float(loss_b.item()))
+        losses_dice.append(float(loss_d.item()))
+
+        step += 1
+        if log_every > 0 and step % log_every == 0:
+            logger.info(
+                f"[train] step={step} loss={safe_mean(losses[-log_every:]):.5f} "
+                f"bce={safe_mean(losses_bce[-log_every:]):.5f} dice={safe_mean(losses_dice[-log_every:]):.5f}"
+            )
+
+    dt = time.time() - t0
+    return {
+        "loss": safe_mean(losses),
+        "bce": safe_mean(losses_bce),
+        "dice": safe_mean(losses_dice),
+        "sec": float(dt),
+    }
+
+@torch.no_grad()
+def eval_loss(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    bce_weight: float,
+    dice_weight: float,
+    pos_weight: Optional[float],
+) -> Dict[str, float]:
+    model.eval()
+    if pos_weight is not None and pos_weight > 0:
+        bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
+    else:
+        bce = nn.BCEWithLogitsLoss()
+
+    losses = []
+    losses_bce = []
+    losses_dice = []
+
+    t0 = time.time()
+    for batch in loader:
+        x, y, _ = batch
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = model(x)
+        loss_b = bce(logits, y)
+        loss_d = soft_dice_loss(logits, y)
+        loss = bce_weight * loss_b + dice_weight * loss_d
+        losses.append(float(loss.item()))
+        losses_bce.append(float(loss_b.item()))
+        losses_dice.append(float(loss_d.item()))
+    dt = time.time() - t0
+    return {
+        "loss": safe_mean(losses),
+        "bce": safe_mean(losses_bce),
+        "dice": safe_mean(losses_dice),
+        "sec": float(dt),
+    }
+
+@torch.no_grad()
+def infer_logits_on_ids(
+    model: nn.Module,
+    ids: List[str],
+    img_dir: str,
+    id2rles: Dict[str, List[str]],
+    size: int,
+    device: torch.device,
+    batch: int,
+    num_workers: int,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    """
+    Returns dict: id -> logits (H,W float32), id -> gt_mask (H,W uint8)
+    Note: Stores full maps in RAM (OK for moderate val sizes; avoid huge).
+    """
+    ds = ShipSegDataset(ids, img_dir, id2rles, size=size, augment=False, seed=123)
+    dl = DataLoader(ds, batch_size=batch, shuffle=False, num_workers=num_workers, pin_memory=True)
+
+    pred_logits: Dict[str, np.ndarray] = {}
+    gt_masks: Dict[str, np.ndarray] = {}
+
+    model.eval()
+    for x, y, img_ids in dl:
+        x = x.to(device, non_blocking=True)
+        logits = model(x)  # B,1,H,W
+        logits = logits.detach().cpu().numpy()[:, 0, :, :]  # B,H,W
+        y_np = y.numpy()[:, 0, :, :].astype(np.uint8)
+        for i, img_id in enumerate(img_ids):
+            pred_logits[str(img_id)] = logits[i].astype(np.float32)
+            gt_masks[str(img_id)] = y_np[i]
+    return pred_logits, gt_masks
+
+def fbeta_pixel_from_prob_and_gt(prob: np.ndarray, gt: np.ndarray, thr: float, beta: float = 2.0, eps: float = 1e-9) -> Tuple[float, float, float, float]:
+    pred = (prob >= thr).astype(np.uint8)
+    t = (gt > 0).astype(np.uint8)
+    tp = float((pred & t).sum())
+    fp = float((pred & (1 - t)).sum())
+    fn = float(((1 - pred) & t).sum())
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    bb = beta * beta
+    fbeta = (1.0 + bb) * precision * recall / (bb * precision + recall + eps)
+    iou = tp / (tp + fp + fn + eps)
+    return precision, recall, fbeta, iou
+
+def grid_search_thr_post(
+    pred_logits: Dict[str, np.ndarray],
+    gt_masks: Dict[str, np.ndarray],
+    thr_grid: List[float],
+    post_grid: List[PostCfg],
+    beta: float,
+    logger: logging.Logger,
+) -> Tuple[float, PostCfg, Dict[str, float]]:
+    """
+    Finds best (thr, postcfg) maximizing mean pixel F_beta over ids.
+    """
+    ids = list(pred_logits.keys())
+    best = (-1.0, None, None)  # fbeta, thr, postcfg
+    best_stats = {}
+
+    # Precompute probs to avoid repeated sigmoid
+    probs: Dict[str, np.ndarray] = {}
+    for img_id in ids:
+        probs[img_id] = sigmoid_np(pred_logits[img_id])
+
+    for thr in thr_grid:
+        for pcfg in post_grid:
+            f_list = []
+            p_list = []
+            r_list = []
+            i_list = []
+            for img_id in ids:
+                prob = probs[img_id]
+                gt = gt_masks[img_id]
+                raw = (prob >= thr).astype(np.uint8)
+                refined = postprocess_mask(raw, pcfg)
+                precision, recall, fbeta, iou = fbeta_pixel_from_prob_and_gt(refined.astype(np.float32), gt, thr=0.5, beta=beta)
+                # Note: refined is already binary, so thr=0.5 is just identity for metric.
+                f_list.append(fbeta)
+                p_list.append(precision)
+                r_list.append(recall)
+                i_list.append(iou)
+            mf = safe_mean(f_list)
+            if mf > best[0]:
+                best = (mf, thr, pcfg)
+                best_stats = {
+                    "precision": safe_mean(p_list),
+                    "recall": safe_mean(r_list),
+                    "fbeta": mf,
+                    "iou": safe_mean(i_list),
+                }
+                logger.info(
+                    f"[grid] new_best fbeta={mf:.6f} thr={thr:.3f} "
+                    f"post(open={pcfg.open_k},close={pcfg.close_k},min_area={pcfg.min_area},merge_k={pcfg.merge_k},merge_iters={pcfg.merge_iters}) "
+                    f"P={best_stats['precision']:.4f} R={best_stats['recall']:.4f} IoU={best_stats['iou']:.4f}"
+                )
+
+    assert best[1] is not None and best[2] is not None
+    return float(best[1]), best[2], best_stats
+
+
+# -------------------------
+# Submission generation (instance-per-row)
+# -------------------------
+
+@torch.no_grad()
+def predict_mask_for_image(
+    model: nn.Module,
+    img_path: str,
+    size: int,
+    device: torch.device,
+) -> np.ndarray:
+    img = pil_to_np_uint8(load_image_rgb(img_path))
+    if img.shape[0] != size or img.shape[1] != size:
+        img = resize_np(img, size, is_mask=False)
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    x = img.astype(np.float32) / 255.0
+    x = (x - mean) / std
+    x = np.transpose(x, (2, 0, 1))[None, ...]  # 1,C,H,W
+    xt = torch.from_numpy(x).to(device)
+    logits = model(xt)
+    prob = torch.sigmoid(logits)[0, 0].detach().cpu().numpy().astype(np.float32)
+    return prob  # H,W
+
+def write_submission_instance_rows(
+    out_csv: str,
+    test_ids: List[str],
+    test_img_dir: str,
+    model: nn.Module,
+    device: torch.device,
+    size: int,
+    seg_thr: float,
+    post_cfg: PostCfg,
+    logger: logging.Logger,
+) -> Dict[str, int]:
+    """
+    Writes variable-row submission:
+    - for each image, if N instances -> N rows (ImageId repeated)
+    - if no instance -> 1 row with empty RLE
+    """
+    n_images = 0
+    n_rows = 0
+    n_nonempty = 0
+
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["ImageId", "EncodedPixels"])
+
+        for img_id in test_ids:
+            n_images += 1
+            img_path = os.path.join(test_img_dir, img_id)
+            prob = predict_mask_for_image(model, img_path, size=size, device=device)
+            raw = (prob >= float(seg_thr)).astype(np.uint8)
+            refined = postprocess_mask(raw, post_cfg)
+            insts = mask_to_instances(refined)
+
+            if len(insts) == 0:
+                w.writerow([img_id, ""])
+                n_rows += 1
+            else:
+                for inst in insts:
+                    rle = mask_to_rle(inst)
+                    if rle != "":
+                        n_nonempty += 1
+                    w.writerow([img_id, rle])
+                    n_rows += 1
+
+            if n_images % 500 == 0:
+                logger.info(f"[submit] processed {n_images}/{len(test_ids)} images ... rows={n_rows} nonempty={n_nonempty}")
+
+    logger.info(f"[submit] done images={n_images} rows={n_rows} nonempty_rows={n_nonempty} out={out_csv}")
+    return {"images": n_images, "rows": n_rows, "nonempty_rows": n_nonempty}
+
+
+# -------------------------
+# Main
+# -------------------------
+
+def build_logger(run_dir: str) -> logging.Logger:
+    logger = logging.getLogger("ship_unet768")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    fh = logging.FileHandler(os.path.join(run_dir, "train.log"), mode="w", encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", type=str, required=True, help="Airbus dataset dir containing CSV and train_v2/test_v2")
+    ap.add_argument("--out_dir", type=str, required=True, help="Output root dir for runs")
+    ap.add_argument("--seed", type=int, default=42)
+
+    ap.add_argument("--train_n", type=int, default=30000)
+    ap.add_argument("--pos_frac", type=float, default=0.40, help="pos fraction in training sample (pos:neg = pos_frac:1-pos_frac)")
+
+    ap.add_argument("--train_ratio", type=float, default=0.70, help="train split ratio for ALL_TRAIN_IDS, rest split into 3 pools")
+    ap.add_argument("--size", type=int, default=768)
+
+    ap.add_argument("--epochs", type=int, default=18)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+
+    ap.add_argument("--unet_base", type=int, default=24, help="UNet base channels (smaller => less VRAM)")
+    ap.add_argument("--batch_train", type=int, default=1)
+    ap.add_argument("--grad_accum", type=int, default=8)
+    ap.add_argument("--batch_eval", type=int, default=2)
+    ap.add_argument("--num_workers", type=int, default=6)
+
+    ap.add_argument("--bce_w", type=float, default=0.7)
+    ap.add_argument("--dice_w", type=float, default=0.3)
+    ap.add_argument("--pos_weight", type=float, default=0.0, help="BCE pos_weight (0 disables). Optional; often helpful but can destabilize.")
+
+    # Pos weighting hyperparams (emphasize many/small instances)
+    ap.add_argument("--small_area_thr", type=int, default=120, help="RLE area threshold treated as small instance")
+    ap.add_argument("--w_inst", type=float, default=0.35, help="weight coef for num_instances")
+    ap.add_argument("--w_small", type=float, default=0.60, help="weight coef for num_small_instances")
+
+    # Grid search
+    ap.add_argument("--beta", type=float, default=2.0, help="pixel F_beta for search (default 2.0)")
+    ap.add_argument("--thr_grid", type=str, default="0.30,0.35,0.40,0.45,0.50,0.55,0.60",
+                    help="comma-separated seg threshold candidates")
+    ap.add_argument("--open_grid", type=str, default="0,1,3",
+                    help="comma-separated open kernel sizes")
+    ap.add_argument("--close_grid", type=str, default="5,7,9,11",
+                    help="comma-separated close kernel sizes")
+    ap.add_argument("--min_area_grid", type=str, default="0,40,60,80,120",
+                    help="comma-separated min_area candidates")
+    ap.add_argument("--merge_k_grid", type=str, default="0,7,9,11",
+                    help="comma-separated merge kernel sizes")
+    ap.add_argument("--merge_iters_grid", type=str, default="0,1,2",
+                    help="comma-separated merge iters candidates")
+
+    args = ap.parse_args()
+
+    set_seed(args.seed)
+
+    # Detect paths
+    data_dir = args.data_dir
+    train_csv = os.path.join(data_dir, "train_ship_segmentations_v2.csv")
+    sample_csv = os.path.join(data_dir, "sample_submission_v2.csv")
+    train_img_dir = os.path.join(data_dir, "train_v2")
+    test_img_dir = os.path.join(data_dir, "test_v2")
+
+    if not os.path.isfile(train_csv):
+        raise FileNotFoundError(train_csv)
+    if not os.path.isfile(sample_csv):
+        raise FileNotFoundError(sample_csv)
+    if not os.path.isdir(train_img_dir):
+        raise FileNotFoundError(train_img_dir)
+    if not os.path.isdir(test_img_dir):
+        raise FileNotFoundError(test_img_dir)
+
+    # Create run dir
+    run_name = f"run__{now_str()}__seed{args.seed}__train{args.train_n}__sz{args.size}"
+    run_dir = os.path.join(args.out_dir, run_name)
+    ensure_dir(run_dir)
+    logger = build_logger(run_dir)
+
+    logger.info("=== START ship_unet768 pipeline ===")
+    logger.info(f"data_dir={data_dir}")
+    logger.info(f"run_dir={run_dir}")
+    logger.info(f"HAS_CV2={HAS_CV2}")
+
+    # Save config
+    save_json(os.path.join(run_dir, "config.json"), vars(args))
+
+    # Load CSV mapping (pos only)
+    t0 = time.time()
+    id2rles = read_train_csv_id2rles(train_csv)
+    logger.info(f"loaded id2rles: pos_ids_in_csv={len(id2rles)} in {time.time()-t0:.1f}s")
+
+    # Build ALL_TRAIN_IDS from directory listing (critical)
+    all_ids = list_dir_image_ids(train_img_dir)
+    logger.info(f"ALL_TRAIN_IDS from dir: {len(all_ids)}")
+
+    pos_ids, neg_ids = build_pos_neg_ids(all_ids, id2rles)
+    logger.info(f"pos_ids={len(pos_ids)} neg_ids={len(neg_ids)} (from dir-based population)")
+
+    # Split ALL IDs into train/rest, rest into 3 pools
+    train_ids_all, rest_ids = split_train_val_pools(all_ids, seed=args.seed, train_ratio=args.train_ratio)
+    val_seg_ids, val_tree_train_ids, val_tree_calib_ids = split_rest_into_three(rest_ids, seed=args.seed)
+
+    save_json(os.path.join(run_dir, "split_ids.json"), {
+        "train_ids_all": train_ids_all,
+        "val_seg_ids": val_seg_ids,
+        "val_tree_train_ids": val_tree_train_ids,
+        "val_tree_calib_ids": val_tree_calib_ids,
+    })
+    logger.info(f"splits: train_all={len(train_ids_all)} val_seg={len(val_seg_ids)} val_tree_train={len(val_tree_train_ids)} val_tree_calib={len(val_tree_calib_ids)}")
+
+    # Build stratified training sample with pos:neg = pos_frac:(1-pos_frac)
+    train_pos_pool = [x for x in train_ids_all if x in id2rles]
+    train_neg_pool = [x for x in train_ids_all if x not in id2rles]
+
+    n_train = int(args.train_n)
+    n_pos = int(round(n_train * float(args.pos_frac)))
+    n_neg = n_train - n_pos
+    n_pos = min(n_pos, len(train_pos_pool))
+    n_neg = min(n_neg, len(train_neg_pool))
+    if n_pos + n_neg < n_train:
+        logger.info(f"[warn] cannot reach train_n={n_train} due to pool sizes, using {n_pos+n_neg}")
+
+    # weighted sampling for positives (emphasize many/small instances)
+    pos_weights = compute_pos_weights(
+        train_pos_pool,
+        id2rles,
+        small_area_thr=int(args.small_area_thr),
+        w_inst=float(args.w_inst),
+        w_small=float(args.w_small),
+    )
+    sampled_pos = weighted_sample_without_replacement(train_pos_pool, pos_weights, k=n_pos, seed=args.seed + 111)
+    # uniform sampling for negatives
+    rng = random.Random(args.seed + 222)
+    rng.shuffle(train_neg_pool)
+    sampled_neg = train_neg_pool[:n_neg]
+
+    train_ids = sampled_pos + sampled_neg
+    rng.shuffle(train_ids)
+
+    save_json(os.path.join(run_dir, "train_sample.json"), {
+        "train_n_req": n_train,
+        "train_n_used": len(train_ids),
+        "pos_frac": float(args.pos_frac),
+        "n_pos": len(sampled_pos),
+        "n_neg": len(sampled_neg),
+        "small_area_thr": int(args.small_area_thr),
+        "w_inst": float(args.w_inst),
+        "w_small": float(args.w_small),
+    })
+    logger.info(f"train sample: n={len(train_ids)} pos={len(sampled_pos)} neg={len(sampled_neg)} pos:neg={len(sampled_pos)}:{len(sampled_neg)}")
+
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"device={device} torch={torch.__version__}")
+    if device.type == "cuda":
+        logger.info(f"gpu_count={torch.cuda.device_count()} name0={torch.cuda.get_device_name(0)}")
+        torch.backends.cudnn.benchmark = True
+
+    # Datasets / loaders
+    aug_cfg = AugConfig()
+    ds_train = ShipSegDataset(train_ids, train_img_dir, id2rles, size=args.size, augment=True, aug_cfg=aug_cfg, seed=args.seed)
+    ds_valseg = ShipSegDataset(val_seg_ids, train_img_dir, id2rles, size=args.size, augment=False, seed=args.seed + 1)
+
+    dl_train = DataLoader(
+        ds_train,
+        batch_size=int(args.batch_train),
+        shuffle=True,
+        num_workers=int(args.num_workers),
+        pin_memory=True,
+        drop_last=True,
+    )
+    dl_valseg = DataLoader(
+        ds_valseg,
+        batch_size=int(args.batch_eval),
+        shuffle=False,
+        num_workers=max(1, int(args.num_workers) // 2),
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    # Model
+    model = UNetGN(in_ch=3, base=int(args.unet_base)).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+
+    # Train loop
+    history_rows = []
+    best_val_loss = 1e9
+    best_path = os.path.join(run_dir, "best_unet.pt")
+
+    logger.info("=== TRAIN START ===")
+    for epoch in range(1, int(args.epochs) + 1):
+        tr = train_one_epoch(
+            model=model,
+            loader=dl_train,
+            opt=opt,
+            device=device,
+            bce_weight=float(args.bce_w),
+            dice_weight=float(args.dice_w),
+            pos_weight=float(args.pos_weight) if float(args.pos_weight) > 0 else None,
+            grad_accum=int(args.grad_accum),
+            log_every=50,
+            logger=logger,
+        )
+        va = eval_loss(
+            model=model,
+            loader=dl_valseg,
+            device=device,
+            bce_weight=float(args.bce_w),
+            dice_weight=float(args.dice_w),
+            pos_weight=float(args.pos_weight) if float(args.pos_weight) > 0 else None,
+        )
+
+        row = {
+            "epoch": int(epoch),
+            "train_loss": tr["loss"],
+            "train_bce": tr["bce"],
+            "train_dice": tr["dice"],
+            "val_loss": va["loss"],
+            "val_bce": va["bce"],
+            "val_dice": va["dice"],
+            "train_sec": tr["sec"],
+            "val_sec": va["sec"],
+        }
+        history_rows.append(row)
+        logger.info(
+            f"[epoch {epoch:03d}] train_loss={tr['loss']:.5f} (bce={tr['bce']:.5f},dice={tr['dice']:.5f}) "
+            f"val_loss={va['loss']:.5f} (bce={va['bce']:.5f},dice={va['dice']:.5f})"
+        )
+
+        # save best by val loss
+        if va["loss"] < best_val_loss:
+            best_val_loss = va["loss"]
+            torch.save(model.state_dict(), best_path)
+            logger.info(f"[ckpt] saved best_unet.pt val_loss={best_val_loss:.6f}")
+
+        # write history CSV each epoch
+        hist_csv = os.path.join(run_dir, "history.csv")
+        with open(hist_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(list(history_rows[0].keys()))
+            for r in history_rows:
+                w.writerow([r[k] for k in history_rows[0].keys()])
+
+    logger.info("=== TRAIN DONE ===")
+
+    # Load best
+    logger.info(f"loading best weights: {best_path}")
+    model.load_state_dict(torch.load(best_path, map_location=device))
+
+    # Grid search (thr + postprocess) on val_seg
+    logger.info("=== GRID SEARCH (seg_thr + postprocess) START ===")
+    thr_grid = [float(x) for x in args.thr_grid.split(",") if x.strip() != ""]
+    open_grid = [int(x) for x in args.open_grid.split(",") if x.strip() != ""]
+    close_grid = [int(x) for x in args.close_grid.split(",") if x.strip() != ""]
+    min_area_grid = [int(x) for x in args.min_area_grid.split(",") if x.strip() != ""]
+    merge_k_grid = [int(x) for x in args.merge_k_grid.split(",") if x.strip() != ""]
+    merge_iters_grid = [int(x) for x in args.merge_iters_grid.split(",") if x.strip() != ""]
+
+    post_grid = []
+    for ok in open_grid:
+        for ck in close_grid:
+            for ma in min_area_grid:
+                for mk in merge_k_grid:
+                    for mi in merge_iters_grid:
+                        post_grid.append(PostCfg(open_k=ok, close_k=ck, min_area=ma, merge_k=mk, merge_iters=mi))
+
+    # For RAM safety: you can reduce val_seg for search if needed.
+    # Here we keep full val_seg_ids; if too large, user can reduce train_ratio or prefilter.
+    pred_logits, gt_masks = infer_logits_on_ids(
+        model=model,
+        ids=val_seg_ids,
+        img_dir=train_img_dir,
+        id2rles=id2rles,
+        size=int(args.size),
+        device=device,
+        batch=int(args.batch_eval),
+        num_workers=max(1, int(args.num_workers) // 2),
+    )
+
+    best_thr, best_post, best_stats = grid_search_thr_post(
+        pred_logits=pred_logits,
+        gt_masks=gt_masks,
+        thr_grid=thr_grid,
+        post_grid=post_grid,
+        beta=float(args.beta),
+        logger=logger,
+    )
+
+    best_params = {
+        "seg_thr": float(best_thr),
+        "postprocess": {
+            "open_k": int(best_post.open_k),
+            "close_k": int(best_post.close_k),
+            "min_area": int(best_post.min_area),
+            "merge_k": int(best_post.merge_k),
+            "merge_iters": int(best_post.merge_iters),
+        },
+        "val_stats": best_stats,
+        "beta": float(args.beta),
+        "HAS_CV2": bool(HAS_CV2),
+    }
+    save_json(os.path.join(run_dir, "best_params.json"), best_params)
+    logger.info(f"[best] seg_thr={best_thr:.3f} post={best_params['postprocess']} val_stats={best_stats}")
+
+    # Submission (instance-per-row)
+    logger.info("=== TEST INFERENCE + SUBMISSION START ===")
+    test_ids = read_sample_submission_ids(sample_csv)
+    sub_path = os.path.join(run_dir, "submission.csv")
+    sub_stats = write_submission_instance_rows(
+        out_csv=sub_path,
+        test_ids=test_ids,
+        test_img_dir=test_img_dir,
+        model=model,
+        device=device,
+        size=int(args.size),
+        seg_thr=float(best_thr),
+        post_cfg=best_post,
+        logger=logger,
+    )
+    save_json(os.path.join(run_dir, "submission_stats.json"), sub_stats)
+
+    logger.info("=== DONE ===")
+    logger.info(f"run_dir={run_dir}")
+    logger.info(f"submission={sub_path}")
+
+if __name__ == "__main__":
+    main()
